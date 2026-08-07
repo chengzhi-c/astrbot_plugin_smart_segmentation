@@ -1,5 +1,7 @@
 # AstrBot 智能分段插件
 
+> 当前版本：v0.2.2（与 `metadata.yaml` 一致，变更见 [CHANGELOG](CHANGELOG.md)）
+
 发送前把主 LLM 回复拆成更像真人聊天的多条消息：先发首段，再按延迟异步补发剩余段。
 
 ## 安装
