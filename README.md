@@ -13,6 +13,8 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
+`requirements-dev.txt` 已包含 `pytest`、`pytest-asyncio` 与 `astrbot` 运行时版本约束（与 `metadata.yaml` 一致）。
+
 ## 配置要点
 
 | 项 | 语义 |

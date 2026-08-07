@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## v0.2.1 (unreleased)
+
+### Testing & Quality
+- 新增 schema 默认值对齐守卫（`_conf_schema.json` default ↔ dataclass default）
+- 新增零运行时依赖 import 边界守卫（相对导入按 AST `level` 判定）
+- 金样扩充至 17+13（从 9+9）：未闭合括号、嵌套括号、纯标点、CRLF、
+  未闭合 thinking、emoji 边界、长文本 cap、尾随垃圾、无标签 fence 含代码、
+  数组内换行、英文括号等
+- 单元测试补充：`extract_json_array_text` 无括号、`cap_segments` max=1、
+  嵌套括号合并、流式边界（换行在 0 位/弱边界不足 min/无边界硬切）
+
+### Refactoring
+- `_CONFIG_KEYS` 从 dataclass 字段自动派生（消除 14 行手工维护）
+- 删除 `_stage_lines` 中不可达兜底（差分 4000 例实证等价）
+- Jitter 常量收敛至 `bounds.py`（`DELAY_JITTER_SECONDS`）
+- shutdown 取消日志降为 DEBUG（高频预期路径降噪）
+
+### Documentation
+- requirements-dev.txt 补充 pytest-asyncio 与 astrbot 依赖
+
 ## v0.2.0
 
 - 拆分模块：settings / segmenter / follow_up / chain_utils / streaming / errors
@@ -9,6 +29,6 @@
 - 流式 C-light：默认不 import/不装补丁；仅 `ResultDecorateStage`；sync 幂等短路
 - 修复流式混合链组件顺序（At/Plain 保持原始顺序）；删死代码与误导注释
 - follow-up 簿记（去重/pending/清态）收进 `FollowUpDispatcher`
-- pytest 79 项：纯逻辑、settings 缓存、boundary、segmenter（超时/取消/无 provider）、
+- pytest 95 项：纯逻辑、settings 缓存、boundary、segmenter（超时/取消/无 provider）、
   follow_up（失败停止/guard）、chain_utils、stream wrapper、patch 多场景、
   端到端流程、金样

@@ -1,2 +1,4 @@
 # Dev-only test dependencies. Runtime plugin needs none.
 pytest>=8.0
+pytest-asyncio
+astrbot>=4.16,<5
