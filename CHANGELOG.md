@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v0.2.1 (unreleased)
+## v0.2.1 (2026-08-07)
 
 ### Testing & Quality
 - 新增 schema 默认值对齐守卫（`_conf_schema.json` default ↔ dataclass default）
@@ -16,9 +16,16 @@
 - 删除 `_stage_lines` 中不可达兜底（差分 4000 例实证等价）
 - Jitter 常量收敛至 `bounds.py`（`DELAY_JITTER_SECONDS`）
 - shutdown 取消日志降为 DEBUG（高频预期路径降噪）
+- 删除 `on_decorating_result` 中不可达流式分支（`ResultDecorateStage` 对
+  `STREAMING_RESULT` 提前返回；流式兼容仅由补丁路径承担，`metadata.yaml`
+  锁定 `<5`）
+
+### Chore
+- 删除无引用 `data/` 目录（cmd_config.json + t2i_templates/，-1313 行）
 
 ### Documentation
 - requirements-dev.txt 补充 pytest-asyncio 与 astrbot 依赖
+- 新增 docs/manual-verify.md 发布前手工验证清单
 
 ## v0.2.0
 
