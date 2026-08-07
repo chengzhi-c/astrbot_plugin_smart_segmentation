@@ -37,6 +37,7 @@ python -m pytest -q
 - 补发走主动 `send_message`，不经普通回复管线的 after-hook（防递归；依赖该 hook 的统计插件可能看不到补发段）。
 - **流式兼容（C-light）**：开启后包装 AstrBot 流式结果并按标点/长度实时切段；**不再** patch 各平台 `send_streaming`。若某平台绕过 decorate 直发，流式分段不保证生效。
 - 流式默认关闭时，不 import、不安装任何补丁（零成本）。
+- 流式兼容仅由 `streaming/patches.py` 的补丁路径承担；插件主处理器对流式结果不可达（astrbot 4.16-4.x `ResultDecorateStage` 对 `STREAMING_RESULT` 提前返回）。本设计基于 `metadata.yaml` 锁定的版本范围（`<5`）。
 
 ## 模块结构
 

@@ -120,7 +120,8 @@ async def _dummy_stream():
 
 
 @pytest.mark.asyncio
-async def test_plugin_streaming_branch_lazily_creates_manager() -> None:
+async def test_streaming_result_passthrough() -> None:
+    """Streaming results are handled by the patch path, never the main processor (A4)."""
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
         ctx,
@@ -133,11 +134,11 @@ async def test_plugin_streaming_branch_lazily_creates_manager() -> None:
         },
     )
     try:
-        result = FakeStreamingResult(_dummy_stream())
+        stream = _dummy_stream()
+        result = FakeStreamingResult(stream)
         event = FakeEvent(result)  # type: ignore[arg-type]
         await plugin.on_decorating_result(event)  # type: ignore[arg-type]
-        assert plugin._streaming is not None
-        assert result.async_stream is not _dummy_stream
+        assert result.async_stream is stream
         assert ctx.generate_calls == []
     finally:
         await plugin.terminate()

@@ -12,7 +12,6 @@ from astrbot.api.star import Context, Star
 from .chain_utils import (
     extract_plain_text_chain,
     is_model_text_result,
-    is_streaming_result,
     replace_plain_text_chain,
 )
 from .follow_up import FollowUpDispatcher
@@ -69,22 +68,6 @@ class SmartSegmentationPlugin(Star):
             return
 
         result = event.get_result()
-
-        # ResultDecorateStage.process 对 STREAMING_RESULT 会提前 return（astrbot
-        # v4.23.3 实测），本处理器在生产中对流式结果不可达；流式包装的实际生效
-        # 路径在 streaming/patches.py 的 patched_process。本分支保留以兼容未来
-        # AstrBot 移除该提前返回后的版本。
-        if is_streaming_result(result):
-            if settings.streaming_compat_enabled:
-                from .streaming.wrapper import decorate_streaming_result
-
-                decorate_streaming_result(
-                    event,
-                    result,
-                    settings,
-                    is_guarded=False,  # 上方已对 guarded 会话早退
-                )
-            return
 
         if self._follow_ups.is_result_applied(event, result):
             logger.debug("智能分段跳过：当前发送结果已经处理过")
