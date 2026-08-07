@@ -108,6 +108,10 @@ class TestJsonExtractAndParse:
         raw = '["（哈\\n哈）", "继续"]'
         assert parse_segments_from_model_output(raw, max_segments=1) == ["（哈\n哈）继续"]
 
+    def test_extract_no_bracket_returns_raw(self) -> None:
+        raw = "模型说分段如下"
+        assert extract_json_array_text(raw) == raw
+
 
 class TestTrailingPeriodAndLocalSplit:
     def test_local_strips_single_period(self) -> None:
@@ -148,6 +152,12 @@ class TestActionAndBrackets:
     def test_merge_unbalanced(self) -> None:
         assert merge_segments_balancing_brackets(["（前", "后）", "完"]) == ["（前后）", "完"]
 
+    def test_merge_brackets_nested(self) -> None:
+        assert merge_segments_balancing_brackets(["（外（内）外）", "后"]) == [
+            "（外（内）外）",
+            "后",
+        ]
+
 
 class TestCapSegments:
     def test_no_op(self) -> None:
@@ -158,6 +168,9 @@ class TestCapSegments:
 
     def test_non_positive_max(self) -> None:
         assert cap_segments(["a", "b"], max_segments=0) == ["a", "b"]
+
+    def test_max_one_merges_all(self) -> None:
+        assert cap_segments(["a", "b", "c"], max_segments=1) == ["abc"]
 
 
 class TestStageInternals:

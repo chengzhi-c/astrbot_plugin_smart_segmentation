@@ -34,3 +34,12 @@ class TestStreamBoundary:
         )
         assert segments == ["一句。", "两句。"]
         assert rest == "未完"
+
+    def test_newline_at_zero_returns_end(self) -> None:
+        assert find_stream_boundary("\nhello", min_chars=2, max_chars=90) == 1
+
+    def test_weak_boundary_before_min_no_cut(self) -> None:
+        assert find_stream_boundary("你，好", min_chars=5, max_chars=90) is None
+
+    def test_hard_cut_at_max_without_boundary(self) -> None:
+        assert find_stream_boundary("a" * 100, min_chars=10, max_chars=50) == 50
