@@ -52,5 +52,53 @@
     "text": "真的吗？太好了！走吧~",
     "max_segments": 5,
     "expected": ["真的吗？", "太好了！", "走吧~"]
+  },
+  {
+    "name": "unclosed_bracket",
+    "text": "他说：（想了想然后继续。等等",
+    "max_segments": 5,
+    "expected": ["他说：（想了想然后继续", "等等"]
+  },
+  {
+    "name": "nested_brackets",
+    "text": "（外（内）外）继续聊。",
+    "max_segments": 5,
+    "expected": ["（外（内）外）", "继续聊"]
+  },
+  {
+    "name": "bracket_only_multi",
+    "text": "（笑）（哭）（点头）",
+    "max_segments": 5,
+    "expected": ["（笑）", "（哭）", "（点头）"]
+  },
+  {
+    "name": "punctuation_only",
+    "text": "。。。？！",
+    "max_segments": 5,
+    "expected": ["。。。？！"]
+  },
+  {
+    "name": "crlf_text",
+    "text": "第一行\r\n第二行\r\n\r\n第三行。",
+    "max_segments": 5,
+    "expected": ["第一行", "第二行", "第三行"]
+  },
+  {
+    "name": "thinking_unclosed",
+    "text": "<think>内部推理未闭合\n\n今天天气不错。",
+    "max_segments": 5,
+    "expected": ["今天天气不错"]
+  },
+  {
+    "name": "emoji_boundary",
+    "text": "哈哈😂今天真不错。继续~",
+    "max_segments": 5,
+    "expected": ["哈哈😂今天真不错", "继续~"]
+  },
+  {
+    "name": "long_text_cap",
+    "text": "一。二。三。四。五。六。",
+    "max_segments": 3,
+    "expected": ["一", "二", "三四五六"]
   }
 ]

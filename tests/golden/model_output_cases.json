@@ -52,5 +52,29 @@
     "raw": "[\"a\", \"b\", \"c\", \"d\"]",
     "max_segments": 3,
     "expected": ["a", "b", "cd"]
+  },
+  {
+    "name": "trailing_garbage",
+    "raw": "[\"a\", \"b\"] 以上是我的分段 垃圾",
+    "max_segments": 5,
+    "expected": ["a", "b"]
+  },
+  {
+    "name": "unlabeled_fence_with_code",
+    "raw": "```\nif ok:\n    pass\n[\"a\", \"b\"]\n```",
+    "max_segments": 5,
+    "expected": ["a", "b"]
+  },
+  {
+    "name": "newline_in_item",
+    "raw": "[\"a\\nb\", \"c\"]",
+    "max_segments": 5,
+    "expected": ["a", "b", "c"]
+  },
+  {
+    "name": "ascii_brackets",
+    "raw": "[\"(nod)\", \"hi\"]",
+    "max_segments": 5,
+    "expected": ["(nod)", "hi"]
   }
 ]
