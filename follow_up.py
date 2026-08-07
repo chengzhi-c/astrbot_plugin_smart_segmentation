@@ -187,7 +187,7 @@ class FollowUpDispatcher:
                         )
                         return
         except asyncio.CancelledError:
-            logger.warning("智能分段后台补发任务被取消，会话: %s", pending.session)
+            logger.debug("智能分段后台补发任务被取消（预期路径），会话: %s", pending.session)
             raise
         except Exception as exc:
             if is_platform_send_failure(exc):
