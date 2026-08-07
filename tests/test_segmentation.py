@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from astrbot_plugin_smart_segmentation.segmentation import (
     split_text_locally,
     strip_thinking_content,
 )
+from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,3 +193,10 @@ class TestBoundsAlignSchema:
         assert schema["delay_per_char"]["slider"]["max"] == MAX_DELAY_PER_CHAR
         assert schema["streaming_min_chars"]["slider"]["max"] == MAX_STREAMING_MIN_CHARS
         assert schema["streaming_max_chars"]["slider"]["max"] == MAX_STREAMING_MAX_CHARS
+
+    def test_schema_defaults_match_dataclass(self) -> None:
+        """Schema default values must match SegmentationSettings defaults."""
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        defaults = SegmentationSettings()
+        for field in fields(SegmentationSettings):
+            assert schema[field.name]["default"] == getattr(defaults, field.name), field.name
