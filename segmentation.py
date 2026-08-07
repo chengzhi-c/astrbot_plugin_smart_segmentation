@@ -5,6 +5,8 @@ import random
 import re
 from typing import Any
 
+from .bounds import DELAY_JITTER_SECONDS
+
 THINKING_TAG_RE = re.compile(
     r"<(?P<tag>think|thinking)\b[^>]*>.*?</(?P=tag)>",
     flags=re.IGNORECASE | re.DOTALL,
@@ -305,5 +307,5 @@ def calculate_send_delay(
     """Compute follow-up delay; rng injects jitter for tests."""
     roller = rng if rng is not None else random
     normalized_delay = delay_base + len(segment) * delay_per_char
-    normalized_delay += roller.uniform(0.0, 0.15)
+    normalized_delay += roller.uniform(0.0, DELAY_JITTER_SECONDS)
     return max(0.0, min(delay_max, normalized_delay))
