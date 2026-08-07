@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -9,6 +10,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
+from .bounds import STREAMING_SYNC_INTERVAL_SECONDS
 from .chain_utils import (
     extract_plain_text_chain,
     is_model_text_result,
@@ -36,7 +38,30 @@ class SmartSegmentationPlugin(Star):
             is_enabled=lambda: self._get_settings() is not None,
         )
         self._streaming: StreamingPatchManager | None = None
+        self._sync_task: asyncio.Task[None] | None = None
         self._sync_streaming(self._get_settings())
+        self._start_sync_loop()
+
+    def _start_sync_loop(self) -> None:
+        """流式路径上没有可用 hook（DecorateStage/RespondStage 均提前返回），
+        补丁的装卸不能只靠消息事件驱动，需要独立的周期同步。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sync_task = loop.create_task(self._sync_loop())
+
+    async def _sync_loop(self) -> None:
+        while not self._stopping:
+            try:
+                await asyncio.sleep(STREAMING_SYNC_INTERVAL_SECONDS)
+                if self._stopping:
+                    return
+                self._sync_streaming(self._get_settings())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("智能分段流式补丁周期同步失败: %s", exc)
 
     def _get_settings(self) -> SegmentationSettings | None:
         return self._settings.get()
@@ -126,6 +151,12 @@ class SmartSegmentationPlugin(Star):
         self._stopping = True
         self._segmenter.mark_stopping()
         self._follow_ups.mark_stopping()
+        if self._sync_task is not None and not self._sync_task.done():
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                pass
         if self._streaming is not None:
             self._streaming.mark_stopping()
         await self._follow_ups.shutdown()

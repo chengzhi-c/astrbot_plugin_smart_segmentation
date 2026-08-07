@@ -52,12 +52,9 @@ class FakeContext:
 
 @pytest.mark.asyncio
 async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def immediate_sleep(_delay: float) -> None:
-        return None
-
     monkeypatch.setattr(
-        "astrbot_plugin_smart_segmentation.follow_up.asyncio.sleep",
-        immediate_sleep,
+        "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
+        lambda *_a, **_k: 0.0,
     )
 
     ctx = FakeContext()
@@ -142,3 +139,38 @@ async def test_streaming_result_passthrough() -> None:
         assert ctx.generate_calls == []
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_sync_loop_installs_patch_without_message_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """流式路径无 hook，补丁装卸必须能不依赖消息事件完成（D-1）。"""
+    from astrbot_plugin_smart_segmentation import main as main_mod
+
+    monkeypatch.setattr(main_mod, "STREAMING_SYNC_INTERVAL_SECONDS", 0.01)
+
+    config = {"enabled": True, "streaming_compat_enabled": False}
+    plugin = main_mod.SmartSegmentationPlugin(FakeContext(), config)  # type: ignore[arg-type]
+    try:
+        assert plugin._streaming is None
+
+        config["streaming_compat_enabled"] = True
+        await asyncio.sleep(0.05)
+
+        assert plugin._streaming is not None
+        assert plugin._streaming._desired_enabled is True
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_sync_loop_stops_on_terminate() -> None:
+    """terminate 必须回收周期同步任务，不留悬挂协程。"""
+    from astrbot_plugin_smart_segmentation import main as main_mod
+
+    plugin = main_mod.SmartSegmentationPlugin(FakeContext(), {"enabled": True})  # type: ignore[arg-type]
+    task = plugin._sync_task
+    assert task is not None
+    await plugin.terminate()
+    assert task.done()

@@ -62,12 +62,9 @@ def test_is_platform_send_failure_plain_exception_false() -> None:
 
 @pytest.mark.asyncio
 async def test_follow_up_sends_all_segments(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def immediate_sleep(_delay: float) -> None:
-        return None
-
     monkeypatch.setattr(
-        "astrbot_plugin_smart_segmentation.follow_up.asyncio.sleep",
-        immediate_sleep,
+        "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
+        lambda *_a, **_k: 0.0,
     )
     ctx = FakeContext()
     dispatcher = FollowUpDispatcher(ctx, is_enabled=lambda: True)  # type: ignore[arg-type]
@@ -86,12 +83,9 @@ async def test_follow_up_sends_all_segments(monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.mark.asyncio
 async def test_follow_up_stops_on_platform_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def immediate_sleep(_delay: float) -> None:
-        return None
-
     monkeypatch.setattr(
-        "astrbot_plugin_smart_segmentation.follow_up.asyncio.sleep",
-        immediate_sleep,
+        "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
+        lambda *_a, **_k: 0.0,
     )
     ctx = FakeContext()
     ctx.fail_once = True
