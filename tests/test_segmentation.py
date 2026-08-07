@@ -21,6 +21,8 @@ from astrbot_plugin_smart_segmentation.bounds import (
 )
 from astrbot_plugin_smart_segmentation.segmentation import (
     SegmentationParseError,
+    _stage_lines,
+    _stage_sentences,
     build_segmentation_prompt,
     calculate_send_delay,
     cap_segments,
@@ -156,6 +158,21 @@ class TestCapSegments:
 
     def test_non_positive_max(self) -> None:
         assert cap_segments(["a", "b"], max_segments=0) == ["a", "b"]
+
+
+class TestStageInternals:
+    def test_stage_lines_no_fallback_needed(self) -> None:
+        """_stage_lines never needs its fallback: split of a stripped non-empty
+        string always yields a non-empty first chunk."""
+        assert _stage_lines(["hello"]) == ["hello"]
+        assert _stage_lines(["a\nb"]) == ["a", "b"]
+        assert _stage_lines(["x\r\ny"]) == ["x", "y"]
+        assert _stage_lines(["a\n\n\nb"]) == ["a", "b"]
+
+    def test_stage_sentences_fallback_reachable(self) -> None:
+        """Pure-punctuation segments hit the `or [seg]` fallback (contrast to B1)."""
+        assert _stage_sentences(["。。。"]) == ["。。。"]
+        assert _stage_sentences(["？！"]) == ["？！"]
 
 
 class TestPromptAndDelay:

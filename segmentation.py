@@ -207,7 +207,7 @@ def _stage_lines(segments: list[str]) -> list[str]:
             result.append(s)
             continue
         lines = [line.strip() for line in re.split(r"\r?\n+", s) if line.strip()]
-        result.extend(lines or [s])
+        result.extend(lines)
     return result
 
 
