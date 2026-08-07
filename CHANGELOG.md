@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## v0.2.2 (2026-08-07)
+
+### Bug Fixes
+- 修复运行时切换 `streaming_compat_enabled` 在纯流式流量下不生效的缺陷（D-1）。
+  根因：流式结果在 `DecorateStage.process` 与 `RespondStage.process` 均提前返回，
+  两个 hook 都不触发，补丁装卸失去驱动。改为 30 秒周期同步（`_sync_loop`）。
+- 修复测试对全局 `asyncio.sleep` 的 monkeypatch 污染（D-1 暴露）：改 patch
+  `calculate_send_delay`，避免影响常驻协程的时间语义。
+
+### Refactoring
+- 折叠 `streaming/patches.py` 中单目标补丁的未使用泛化（PatchHandle 单实例
+  脚手架，净减 32 行；7 步状态机差分验证等价）
+- 流式弱边界取窗口内最晚位置（O-13 B：段落更长、碎片更少）
+
+### Testing
+- 新增真实 Stage 流式集成测试（O-11）：把 O-1/A4 的一次性探针固化为常驻
+  守卫（提前返回属实 / 补丁包装 / 卸载原样）
+- 新增 `astrbot_version` 上界断言（O-12）：锁定 A4 的成立前提 <5
+- 新增 D-1 周期同步测试（不改配置不发消息也能装卸补丁 / terminate 回收任务）
+- 手工验证清单扩充至 14 项含部署步骤（真实 QQ 环境执行，见 docs/manual-verify.md）
+
 ## v0.2.1 (2026-08-07)
 
 ### Testing & Quality
