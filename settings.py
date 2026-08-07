@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from astrbot.api import logger
@@ -19,23 +19,6 @@ from .bounds import (
     MAX_TEMPERATURE,
     MAX_TIMEOUT_SECONDS,
     MAX_TOKENS,
-)
-
-_CONFIG_KEYS = (
-    "enabled",
-    "provider_id",
-    "style",
-    "min_length",
-    "max_segments",
-    "temperature",
-    "max_tokens",
-    "timeout_seconds",
-    "delay_base",
-    "delay_per_char",
-    "delay_max",
-    "streaming_compat_enabled",
-    "streaming_min_chars",
-    "streaming_max_chars",
 )
 
 
@@ -58,6 +41,8 @@ class SegmentationSettings:
 
 
 _DEFAULTS = SegmentationSettings()
+
+_CONFIG_KEYS = tuple(f.name for f in fields(SegmentationSettings))
 
 
 def _get_config_value(config: Any, key: str, default: Any) -> Any:

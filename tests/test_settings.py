@@ -54,3 +54,26 @@ class TestSettingsLoaderCache:
         assert loader.get() is not None
         cfg["enabled"] = False
         assert loader.get() is None
+
+
+def test_config_keys_derived_correctly() -> None:
+    """_CONFIG_KEYS matches dataclass field order (snapshot for migration)."""
+    from astrbot_plugin_smart_segmentation.settings import _CONFIG_KEYS
+
+    expected = (
+        "enabled",
+        "provider_id",
+        "style",
+        "min_length",
+        "max_segments",
+        "temperature",
+        "max_tokens",
+        "timeout_seconds",
+        "delay_base",
+        "delay_per_char",
+        "delay_max",
+        "streaming_compat_enabled",
+        "streaming_min_chars",
+        "streaming_max_chars",
+    )
+    assert _CONFIG_KEYS == expected
