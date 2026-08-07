@@ -76,7 +76,7 @@ def test_streaming_patch_real_install_and_restore() -> None:
     )
     try:
         assert plugin._streaming is not None
-        assert plugin._streaming._handle.installed is True
+        assert plugin._streaming._installed is True
         assert ResultDecorateStage.process is not original
         assert (
             getattr(
