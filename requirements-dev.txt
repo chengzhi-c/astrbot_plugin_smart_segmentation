@@ -1,0 +1,2 @@
+# Dev-only test dependencies. Runtime plugin needs none.
+pytest>=8.0

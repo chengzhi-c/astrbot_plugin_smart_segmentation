@@ -1,0 +1,56 @@
+[
+  {
+    "name": "two_sentences",
+    "text": "今天天气不错。要不要出去走走？",
+    "max_segments": 5,
+    "expected": ["今天天气不错", "要不要出去走走？"]
+  },
+  {
+    "name": "action_only",
+    "text": "（歪头看你）",
+    "max_segments": 5,
+    "expected": ["（歪头看你）"]
+  },
+  {
+    "name": "inline_action",
+    "text": "等等（抬手）我再说一遍。",
+    "max_segments": 5,
+    "expected": ["等等", "（抬手）", "我再说一遍"]
+  },
+  {
+    "name": "multiline",
+    "text": "第一行\n第二行还在\n第三行。",
+    "max_segments": 5,
+    "expected": ["第一行", "第二行还在", "第三行"]
+  },
+  {
+    "name": "thinking_stripped",
+    "text": "<think>内部推理</think>你好呀。晚上见。",
+    "max_segments": 5,
+    "expected": ["你好呀", "晚上见"]
+  },
+  {
+    "name": "cap_two",
+    "text": "一。二。三。四。",
+    "max_segments": 2,
+    "expected": ["一", "二三四"]
+  },
+  {
+    "name": "max_segments_one_degenerate",
+    "text": "一。二。",
+    "max_segments": 1,
+    "expected": ["一二"]
+  },
+  {
+    "name": "ellipsis_kept",
+    "text": "我再想想。。。好吧。",
+    "max_segments": 5,
+    "expected": ["我再想想。。。", "好吧"]
+  },
+  {
+    "name": "exclaim_question",
+    "text": "真的吗？太好了！走吧~",
+    "max_segments": 5,
+    "expected": ["真的吗？", "太好了！", "走吧~"]
+  }
+]
