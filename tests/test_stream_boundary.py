@@ -43,3 +43,8 @@ class TestStreamBoundary:
 
     def test_hard_cut_at_max_without_boundary(self) -> None:
         assert find_stream_boundary("a" * 100, min_chars=10, max_chars=50) == 50
+
+    def test_weak_boundary_picks_latest_not_first_declared(self) -> None:
+        """弱边界应取最晚位置，而非常量声明顺序最靠前的（O-13）。"""
+        # 逗号 index 1，分号 index 4；应在分号后切
+        assert find_stream_boundary("啊，这样；好吧", min_chars=1, max_chars=7) == 5

@@ -37,10 +37,9 @@ def find_stream_boundary(
     max_chars = max(min_chars, max_chars)
     if len(text) >= max_chars:
         window = text[:max_chars]
-        for mark in WEAK_BOUNDARY_MARKS:
-            split_at = window.rfind(mark)
-            if split_at >= min_chars:
-                return split_at + 1
+        split_at = max(window.rfind(mark) for mark in WEAK_BOUNDARY_MARKS)
+        if split_at >= min_chars:
+            return split_at + 1
         return max_chars
 
     return None
