@@ -108,9 +108,16 @@ class SmartSegmentationPlugin(Star):
         segments = await self._segmenter.segment(event, outbound_text, settings)
         if not segments or len(segments) <= 1:
             return
+        if self._stopping:
+            # terminate 可能落在分段调用期间：此时替换链会被 after_message_sent
+            # 丢弃补发，用户只看到首段。停止中保持原样发送。
+            logger.debug("智能分段跳过：插件正在停止")
+            return
 
         first_segment = segments[0]
         follow_up_segments = segments[1:]
+        # 先换链再登记是刻意顺序：登记成功但换链失败会造成补发 + 原链全文
+        # 重复发送，比当前的失败模式（补发缺失）更差。
         if not replace_plain_text_chain(result, first_segment):
             return
 

@@ -4,9 +4,10 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from astrbot.api.event import MessageChain
+from astrbot.api.event import MessageChain, ResultContentType
 from astrbot.api.message_components import Plain
 
+from astrbot_plugin_smart_segmentation.chain_utils import is_streaming_result
 from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
 
 
@@ -92,6 +93,32 @@ async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plugin_skips_segmentation_when_stopping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """terminate 落在分段调用期间时不得替换结果链。
+
+    否则链已被换成首段、补发又被 after_message_sent 丢弃，用户只看到首段。
+    """
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(ctx, {"enabled": True, "min_length": 2})  # type: ignore[arg-type]
+    result = FakeResult("你好。世界。继续说一点")
+    event = FakeEvent(result)
+
+    async def fake_segment(event, text, settings):
+        plugin._stopping = True  # 模拟 terminate 在分段调用期间发生
+        return ["你好", "世界", "继续说一点"]
+
+    monkeypatch.setattr(plugin._segmenter, "segment", fake_segment)
+
+    await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+    assert [c.text for c in result.chain] == ["你好。世界。继续说一点"]
+    assert plugin._follow_ups.pending_id_of(event) == ""
+
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_plugin_disabled_passthrough() -> None:
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(ctx, {"enabled": False})  # type: ignore[arg-type]
@@ -104,7 +131,7 @@ async def test_plugin_disabled_passthrough() -> None:
 
 
 class FakeStreamingResult:
-    result_content_type = "STREAMING_RESULT"
+    result_content_type = ResultContentType.STREAMING_RESULT
 
     def __init__(self, stream) -> None:
         self.async_stream = stream
@@ -134,6 +161,8 @@ async def test_streaming_result_passthrough() -> None:
         stream = _dummy_stream()
         result = FakeStreamingResult(stream)
         event = FakeEvent(result)  # type: ignore[arg-type]
+        # fake 必须真的是流式结果，否则本测试走的是普通提前返回路径
+        assert is_streaming_result(result) is True
         await plugin.on_decorating_result(event)  # type: ignore[arg-type]
         assert result.async_stream is stream
         assert ctx.generate_calls == []

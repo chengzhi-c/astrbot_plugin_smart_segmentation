@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -71,8 +70,25 @@ def test_terminate_clean() -> None:
         pass
 
     plugin = SmartSegmentationPlugin(FakeContext(), {"enabled": True})  # type: ignore[arg-type]
-    asyncio.run(plugin.terminate())
+
+    async def scenario() -> None:
+        # 先制造真实的在飞状态，否则下面的清理断言是空 vs 空
+        pending_id = plugin._follow_ups.register(
+            session="sess:1",
+            segments=["二", "三"],
+            settings=plugin._get_settings(),
+        )
+        assert pending_id
+        plugin._follow_ups.schedule(plugin._follow_ups.pop(pending_id))
+        await plugin.terminate()
+
+    asyncio.run(scenario())
     assert plugin._stopping is True
+    # terminate 必须通知各子系统，否则在飞的分段调用/补发任务不会被拦下
+    assert plugin._segmenter._stopping is True
+    assert plugin._follow_ups._stopping is True
+    assert plugin._follow_ups._pending == {}
+    assert plugin._follow_ups._tasks == set()
 
 
 def test_disabled_plugin_no_streaming_manager() -> None:

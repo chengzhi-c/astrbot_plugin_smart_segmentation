@@ -100,5 +100,17 @@
     "text": "一。二。三。四。五。六。",
     "max_segments": 3,
     "expected": ["一", "二", "三四五六"]
+  },
+  {
+    "name": "leading_marks_attached",
+    "text": "！出大事了。怎么办。",
+    "max_segments": 5,
+    "expected": ["！出大事了", "怎么办"]
+  },
+  {
+    "name": "leading_marks_after_bracket",
+    "text": "（看）！快走。",
+    "max_segments": 5,
+    "expected": ["（看）", "！快走"]
   }
 ]

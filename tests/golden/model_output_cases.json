@@ -76,5 +76,11 @@
     "raw": "[\"(nod)\", \"hi\"]",
     "max_segments": 5,
     "expected": ["(nod)", "hi"]
+  },
+  {
+    "name": "surplus_close_bracket_not_merged",
+    "raw": "[\"你好）\", \"今天天气不错\", \"我们出去玩吧\"]",
+    "max_segments": 5,
+    "expected": ["你好）", "今天天气不错", "我们出去玩吧"]
   }
 ]

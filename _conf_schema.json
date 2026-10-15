@@ -115,7 +115,7 @@
   "streaming_min_chars": {
     "type": "int",
     "description": "流式最短分段长度",
-    "hint": "短于该长度时即使命中标点也先继续等待，避免消息过碎。",
+    "hint": "短于该长度时即使命中标点或换行也先继续等待，避免消息过碎。",
     "default": 18,
     "slider": {
       "min": 1,
@@ -126,7 +126,7 @@
   "streaming_max_chars": {
     "type": "int",
     "description": "流式最长分段长度",
-    "hint": "超过该长度时会尽量按逗号、分号、空格等弱边界切分，避免长时间不出消息。",
+    "hint": "超过该长度时会尽量按逗号、分号、空格等弱边界或换行切分，避免长时间不出消息。",
     "default": 90,
     "slider": {
       "min": 20,

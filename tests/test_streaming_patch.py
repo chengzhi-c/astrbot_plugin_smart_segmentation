@@ -1,58 +1,15 @@
+"""Unit tests for the streaming patch recovery state machine.
+
+Real install/restore against the actual ResultDecorateStage is covered by
+test_plugin_load.py and test_streaming_integration.py.
+"""
+
 from __future__ import annotations
 
 from astrbot_plugin_smart_segmentation.streaming.patches import (
     StreamingPatchManager,
     _PATCH_OWNER_ATTR,
 )
-
-
-class _Target:
-    async def process(self, event):
-        if False:
-            yield None
-
-
-def test_patch_install_and_restore_owner() -> None:
-    calls: list[str] = []
-
-    class Holder:
-        async def process(self, event):
-            calls.append("original")
-            if False:
-                yield None
-
-    Holder._smart_segmentation_original_process = None  # type: ignore[attr-defined]
-
-    class Stage:
-        process = Holder.process
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="owner-token",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
-
-    manager._holder = Stage
-    assert manager._prepare_install()
-    assert manager._original is not None
-
-    async def patched(stage_self, event):
-        async for item in manager._original(stage_self, event):  # type: ignore[misc]
-            yield item
-
-    setattr(patched, _PATCH_OWNER_ATTR, "owner-token")
-    Stage.process = patched
-    manager._installed = True
-
-    assert getattr(Stage.process, _PATCH_OWNER_ATTR) == "owner-token"
-    manager._restore()
-    assert manager._installed is False
-    assert Stage.process is manager._original
 
 
 def test_prepare_install_restores_foreign_then_installs() -> None:

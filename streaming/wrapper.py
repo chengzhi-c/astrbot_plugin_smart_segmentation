@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import AsyncGenerator
 
 from astrbot.api import logger
@@ -23,18 +22,35 @@ def find_stream_boundary(
     min_chars: int,
     max_chars: int,
 ) -> int | None:
-    newline_match = re.search(r"\n+", text)
-    if newline_match is not None:
-        if newline_match.start() > 0:
-            return newline_match.start()
-        return newline_match.end()
-
     min_chars = max(1, min_chars)
-    for index, char in enumerate(text):
-        if char in STRONG_BOUNDARY_MARKS and index + 1 >= min_chars:
+    max_chars = max(min_chars, max_chars)
+
+    # 只在 [min_chars-1, max_chars) 窗口内定位边界：合格边界的起点必落在窗口内，
+    # 不必每次都对剩余全文扫描（大 chunk 下那是 O(N^2/min_chars)，阻塞事件循环）。
+    window_end = min(max_chars, len(text))
+
+    # 换行受 min/max 约束：不足 min_chars 会碎，超过 max_chars 等太久。第一个
+    # 换行不满足时继续看后面的换行——否则"短首行 + 按行列举"这类常见回复形状
+    # 会完全失去实时分段，全文憋到流结束才发出。
+    # 边界取换行 run 的末尾（含换行符本身）：平台把各段 Plain 无分隔符拼接，
+    # 丢边界换行会把 markdown 列表/分步说明黏成一行。
+    newline_at = text.find("\n", min_chars - 1, window_end)
+    if newline_at != -1:
+        # 命中位置必在某个换行 run 内（run 可能从窗口前开始）；run 末尾超过
+        # max_chars 时，后续 run 的末尾只会更大，即不存在合格换行边界。
+        run_end = newline_at + 1
+        run_limit = min(len(text), max_chars + 1)
+        while run_end < run_limit and text[run_end] == "\n":
+            run_end += 1
+        if run_end <= max_chars:
+            return run_end
+
+    for index in range(min_chars - 1, window_end):
+        # 强句读符同样受 max_chars 约束：只查下界会让超长句子整段穿过，
+        # 且分段结果随 provider 的 chunk 大小漂移（同一文本切法不同）。
+        if text[index] in STRONG_BOUNDARY_MARKS:
             return index + 1
 
-    max_chars = max(min_chars, max_chars)
     if len(text) >= max_chars:
         window = text[:max_chars]
         split_at = max(window.rfind(mark) for mark in WEAK_BOUNDARY_MARKS)
@@ -62,9 +78,10 @@ def pop_stream_segments(
         )
         if boundary is None:
             break
-        segment = text[:boundary].strip()
+        # 只去空格/制表符：换行符是内容（平台无分隔符拼接各段），不能剥掉
+        segment = text[:boundary].strip(" \t")
         text = text[boundary:].lstrip()
-        if segment:
+        if segment.strip():
             segments.append(segment)
 
     return segments, text
@@ -97,6 +114,15 @@ async def stream_realtime_segments(
                 yield chain
                 continue
 
+            # 平台专用链（audio_chunk / reasoning / tool_call 等）的 type 承载业务
+            # 语义（如 webchat 的音频播放），不能拆也不能丢，原样透传。
+            if chain.type is not None and chain.type != "break":
+                if (flush := _make_flush_chain(buffer)):
+                    yield flush
+                    buffer = ""
+                yield chain
+                continue
+
             # Preserve original component order: Plain merges into the pending
             # buffer (flushing when a boundary is reached), non-Plain flushes
             # the buffer first and passes through.
@@ -121,9 +147,12 @@ async def stream_realtime_segments(
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        # 先把已缓冲内容 flush 给用户，再上抛：未打补丁的核心语义就是让源流异常
+        # 冒泡到平台，吞掉它会让用户拿到静默截断的回复还以为发送成功。
         logger.error("智能分段流式兼容处理异常: %s", exc, exc_info=True)
         if (flush := _make_flush_chain(buffer)):
             yield flush
+        raise
 
 
 def decorate_streaming_result(

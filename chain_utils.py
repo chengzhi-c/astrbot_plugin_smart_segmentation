@@ -39,6 +39,9 @@ def replace_plain_text_chain(message_chain: MessageChain, text: str) -> bool:
     if not _is_plain_chain(message_chain):
         return False
 
+    # 只保留首个 Plain 并写入首段：第 2+ 个 Plain 的文本已包含在 extract 时
+    # join 的全文里（分段后由补发段送达），此处丢弃不丢内容。非 Plain 组件
+    # 保持原有相对顺序。
     replaced = False
     next_chain = []
     for component in message_chain.chain:
@@ -54,10 +57,16 @@ def replace_plain_text_chain(message_chain: MessageChain, text: str) -> bool:
 
 
 def is_model_text_result(result: MessageEventResult) -> bool:
-    is_model_result = getattr(result, "is_model_result", None)
-    if callable(is_model_result):
+    # is_model_result 自 astrbot 4.20 才有；缺失时回退 is_llm_result（各版本均有），
+    # 否则旧版本上任何插件的纯文本结果都会被误当成模型回复拿去分段。
+    checker = getattr(result, "is_model_result", None) or getattr(
+        result,
+        "is_llm_result",
+        None,
+    )
+    if callable(checker):
         try:
-            if not is_model_result():
+            if not checker():
                 return False
         except Exception:
             return False

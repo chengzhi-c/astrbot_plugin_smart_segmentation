@@ -7,7 +7,6 @@ import pytest
 
 from astrbot_plugin_smart_segmentation.segmenter import OutboundSegmenter
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-from astrbot_plugin_smart_segmentation.streaming.wrapper import stream_realtime_segments
 from astrbot_plugin_smart_segmentation.errors import brief_exception
 
 
@@ -85,11 +84,89 @@ async def test_segment_no_provider_falls_back() -> None:
     assert segs == ["第一句", "第二句"]
 
 
+class RaisingGenerateContext:
+    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        return "p1"
+
+    async def llm_generate(self, **kwargs):
+        raise RuntimeError("provider exploded")
+
+
+@pytest.mark.asyncio
+async def test_segment_llm_exception_falls_back() -> None:
+    """LLM 调用抛异常必须走本地兜底：冒泡出 hook 会让每条消息都炸。"""
+    segmenter = OutboundSegmenter(RaisingGenerateContext())  # type: ignore[arg-type]
+    event = SimpleNamespace(unified_msg_origin="sess:1")
+    settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
+    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
+    assert segs == ["第一句", "第二句"]
+
+
+@pytest.mark.asyncio
+async def test_segment_empty_completion_skips() -> None:
+    """模型返回空内容时不分段（而不是拿原文去本地切）。"""
+    ctx = FakeContext(completion="")
+    segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
+    event = SimpleNamespace(unified_msg_origin="sess:1")
+    settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
+    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
+    assert segs == []
+
+
+@pytest.mark.asyncio
+async def test_segment_prefers_configured_provider_id() -> None:
+    """配置了 provider_id 时优先用它，且不再查询当前会话 provider。"""
+    ctx = FakeContext(provider_id="session-provider")
+    segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
+    event = SimpleNamespace(unified_msg_origin="sess:1")
+    settings = SegmentationSettings(
+        min_length=2, max_segments=5, timeout_seconds=5, provider_id="configured"
+    )
+    await segmenter.segment(event, "你好。世界。继续说一点", settings)  # type: ignore[arg-type]
+    assert ctx.generate_calls[0].get("chat_provider_id") == "configured"
+
+
 def test_brief_exception_truncates() -> None:
     exc = RuntimeError("x" * 500)
     text = brief_exception(exc)
     assert text.startswith("RuntimeError:")
     assert len(text) < 220
+
+
+def test_brief_exception_formats_dict_result() -> None:
+    """平台异常的 exc.result dict 走 wording 字段并被截断。"""
+    exc = RuntimeError("boom")
+    exc.result = {  # type: ignore[attr-defined]
+        "retcode": 1200,
+        "wording": "发送失败" + "y" * 500,
+    }
+    text = brief_exception(exc)
+    assert text.startswith("RuntimeError(retcode=1200")
+    assert "发送失败" in text
+    assert len(text) < 220
+
+
+class TypeErrorGenerateContext:
+    """llm_generate 声明接受 chat_provider_id，调用时却抛 TypeError（旧签名）。"""
+
+    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        return "p1"
+
+    async def llm_generate(self, **kwargs):
+        if "chat_provider_id" in kwargs:
+            raise TypeError("unexpected keyword argument 'chat_provider_id'")
+        return SimpleNamespace(completion_text='["a", "b"]')
+
+
+@pytest.mark.asyncio
+async def test_llm_generate_retries_prompt_only_on_type_error() -> None:
+    """带参调用被旧签名拒绝时必须退化为 prompt-only 重试一次。"""
+    segmenter = OutboundSegmenter(TypeErrorGenerateContext())  # type: ignore[arg-type]
+    event = SimpleNamespace(unified_msg_origin="sess:1")
+    settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
+    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
+    # 本地兜底会得到 ["第一句", "第二句"]；走到重试才证明降级路径生效
+    assert segs == ["a", "b"]
 
 
 @pytest.mark.asyncio
@@ -144,21 +221,3 @@ async def test_provider_id_typeerror_fallback() -> None:
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
     segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
     assert segs == ["第一句", "第二句"]
-
-
-@pytest.mark.asyncio
-async def test_stream_realtime_splits_sentences() -> None:
-    async def gen():
-        from astrbot.api.event import MessageChain
-        from astrbot.api.message_components import Plain
-
-        yield MessageChain([Plain("你好啊。接下来")])
-        yield MessageChain([Plain("继续说。尾巴")])
-
-    settings = SegmentationSettings(streaming_min_chars=3, streaming_max_chars=90)
-    out: list[str] = []
-    async for chain in stream_realtime_segments(gen(), settings):
-        texts = [c.text for c in chain.chain if hasattr(c, "text")]
-        out.extend(texts)
-    assert out[0] == "你好啊。"
-    assert any("继续说。" in item for item in out)

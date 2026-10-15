@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import weakref
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from .segmentation import calculate_send_delay
 from .settings import SegmentationSettings
 
 _PENDING_EXTRA_KEY = "smart_segmentation_pending_id"
-_APPLIED_EXTRA_KEY = "smart_segmentation_applied_result_id"
+_APPLIED_EXTRA_KEY = "smart_segmentation_applied_result"
 
 
 @dataclass(slots=True)
@@ -34,6 +35,29 @@ class PendingFollowUp:
     expires_at: float
 
 
+class _AppliedResult:
+    """标记某个 result 对象已被分段处理过。
+
+    不能只存 id()：result 释放后地址可能被同一 event 上的新 result 复用
+    （agent 多步循环每步都新建 MessageEventResult），会把新回复误判为
+    已处理而静默跳过分段。
+    """
+
+    __slots__ = ("_resolve",)
+
+    def __init__(self, result: Any) -> None:
+        try:
+            ref = weakref.ref(result)
+        except TypeError:  # 不支持弱引用的对象退化为强引用
+            self._resolve = lambda: result
+        else:
+            self._resolve = ref
+
+    def matches(self, result: Any) -> bool:
+        resolved = self._resolve()
+        return resolved is not None and resolved is result
+
+
 def is_platform_send_failure(exc: Exception) -> bool:
     if exc.__class__.__name__ == "ActionFailed":
         return True
@@ -43,7 +67,7 @@ def is_platform_send_failure(exc: Exception) -> bool:
     if isinstance(result, dict):
         status = str(result.get("status", "")).lower()
         retcode = result.get("retcode")
-        return status == "failed" or retcode not in (None, 0)
+        return status == "failed" or retcode not in (None, 0, "0")
     return False
 
 
@@ -83,10 +107,11 @@ class FollowUpDispatcher:
 
     def mark_pending(self, event: Any, pending_id: str, result: Any) -> None:
         event.set_extra(_PENDING_EXTRA_KEY, pending_id)
-        event.set_extra(_APPLIED_EXTRA_KEY, id(result))
+        event.set_extra(_APPLIED_EXTRA_KEY, _AppliedResult(result))
 
     def is_result_applied(self, event: Any, result: Any) -> bool:
-        return str(event.get_extra(_APPLIED_EXTRA_KEY, "") or "") == str(id(result))
+        marker = event.get_extra(_APPLIED_EXTRA_KEY, None)
+        return isinstance(marker, _AppliedResult) and marker.matches(result)
 
     def pending_id_of(self, event: Any) -> str:
         return str(event.get_extra(_PENDING_EXTRA_KEY, "") or "").strip()

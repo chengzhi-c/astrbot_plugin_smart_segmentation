@@ -128,3 +128,51 @@ async def test_unpatched_leaves_streaming_untouched() -> None:
         assert result.async_stream is original_stream
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_patched_process_delegates_non_streaming_to_original() -> None:
+    """补丁必须把非流式结果委托给原 stage，并透传其产出。
+
+    漏掉这步不会破坏流式路径，但开启流式兼容后所有普通回复都会跳过
+    ResultDecorateStage——所有插件的 on_decorating_result 钩子、回复前缀、
+    内置分段回复、TTS 全部静默失效。
+    """
+    real_process = ResultDecorateStage.process
+    # 归一化补丁状态：前序测试文件可能在类上留下 _ORIGINAL_ATTR（设计如此），
+    # 不清掉的话下面的桩替换会被当成"外来修改"而跳过安装。
+    pristine = getattr(ResultDecorateStage, _ORIGINAL_ATTR, real_process)
+    if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):
+        delattr(ResultDecorateStage, _ORIGINAL_ATTR)
+    delegated: list[str] = []
+
+    async def stub_process(stage_self, event):
+        delegated.append("original")
+        yield "sentinel"
+
+    try:
+        # 装补丁前把 stage 的 process 换成桩：补丁会捕获它作为 original
+        ResultDecorateStage.process = stub_process
+        plugin = SmartSegmentationPlugin(
+            _FakeContext(),
+            {"enabled": True, "streaming_compat_enabled": True},
+        )
+        assert plugin._streaming is not None
+        assert plugin._streaming._installed is True
+
+        result = MessageEventResult()
+        result.chain = [Plain("普通回复。")]
+        result.result_content_type = ResultContentType.LLM_RESULT
+        event = _FakeEvent(result)
+
+        items = [
+            item
+            async for item in ResultDecorateStage.process(ResultDecorateStage(), event)
+        ]
+        assert delegated == ["original"]
+        assert items == ["sentinel"]
+        await plugin.terminate()
+    finally:
+        ResultDecorateStage.process = pristine
+        if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):
+            delattr(ResultDecorateStage, _ORIGINAL_ATTR)

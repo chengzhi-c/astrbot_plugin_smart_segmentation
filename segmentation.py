@@ -11,6 +11,7 @@ THINKING_TAG_RE = re.compile(
     r"<(?P<tag>think|thinking)\b[^>]*>.*?</(?P=tag)>",
     flags=re.IGNORECASE | re.DOTALL,
 )
+THINKING_CLOSE_RE = re.compile(r"</(?:think|thinking)>", flags=re.IGNORECASE)
 UNCLOSED_THINKING_TAG_RE = re.compile(
     r"^\s*<(?:think|thinking)\b[^>]*>.*?(?:$|(?=\n{2,}|\r\n\r\n))",
     flags=re.IGNORECASE | re.DOTALL,
@@ -61,7 +62,12 @@ def cap_segments(segments: list[str], *, max_segments: int) -> list[str]:
 def strip_thinking_content(text: str) -> str:
     if not text:
         return ""
-    cleaned_text = THINKING_TAG_RE.sub("", str(text))
+    cleaned_text = str(text)
+    # THINKING_TAG_RE 右端必须是闭合标签：探不到闭合标签时它必然空转，但大量
+    # 未闭合开标签会让其回溯爆炸（O(n^2)，56k 字符约 2s，阻塞事件循环）。
+    # 先廉价探一次再决定是否执行该 sub（语义等价）。
+    if THINKING_CLOSE_RE.search(cleaned_text):
+        cleaned_text = THINKING_TAG_RE.sub("", cleaned_text)
     cleaned_text = UNCLOSED_THINKING_TAG_RE.sub("", cleaned_text)
     cleaned_text = THINKING_BOUNDARY_RE.sub("", cleaned_text)
     return cleaned_text.strip()
@@ -86,10 +92,11 @@ def extract_json_array_text(raw_text: str) -> str:
 
     for candidate in candidates:
         try:
-            json.loads(candidate)
-        except (json.JSONDecodeError, TypeError):
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError, RecursionError):
             continue
-        return candidate
+        if isinstance(parsed, list):
+            return candidate
     return result_text
 
 
@@ -113,8 +120,19 @@ def is_action_only_text(text: str) -> bool:
 
 
 def has_unbalanced_brackets(text: str) -> bool:
+    """仅当左括号多于右括号（含未闭合）时判定为不均衡。
+
+    右括号过剩（模型多输出的孤立右括号、`:)` 类表情）不需要向后合并段来配平，
+    判为不均衡会把后续所有段粘成一条。
+    """
     for open_bracket, close_bracket in BRACKET_PAIRS:
-        if text.count(open_bracket) != text.count(close_bracket):
+        depth = 0
+        for char in text:
+            if char == open_bracket:
+                depth += 1
+            elif char == close_bracket:
+                depth -= 1
+        if depth > 0:
             return True
     return False
 
@@ -220,12 +238,21 @@ def _stage_sentences(segments: list[str]) -> list[str]:
         if is_action_only_text(seg):
             result.append(seg)
             continue
-        sentences = [
-            _strip_single_trailing_period(m.group(0).strip())
-            for m in SENTENCE_BOUNDARY_RE.finditer(seg)
-            if _strip_single_trailing_period(m.group(0).strip())
-        ]
-        result.extend(sentences or [seg])
+        # 段首句读符无法被 SENTENCE_BOUNDARY_RE 匹配（匹配必须以非句读符开头），
+        # 先剥离再拼回首句，否则这些字符会被静默丢弃。
+        rest = seg.lstrip(STRONG_BOUNDARY_MARKS)
+        leading_marks = seg[: len(seg) - len(rest)]
+        sentences: list[str] = []
+        for match in SENTENCE_BOUNDARY_RE.finditer(rest):
+            sentence = _strip_single_trailing_period(match.group(0).strip())
+            if sentence:
+                sentences.append(sentence)
+        if not sentences:
+            if seg:
+                result.append(seg)
+            continue
+        sentences[0] = leading_marks + sentences[0]
+        result.extend(sentences)
     return result
 
 
@@ -288,7 +315,7 @@ def parse_segments_from_model_output(
         json_text = extract_json_array_text(raw_text)
         segments = json.loads(json_text)
         normalized = normalize_segments(segments, max_segments=max_segments)
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+    except (json.JSONDecodeError, ValueError, TypeError, RecursionError) as exc:
         raise SegmentationParseError("模型返回的分段结果无法解析") from exc
 
     balanced = merge_segments_balancing_brackets(normalized)
