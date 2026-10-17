@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from astrbot_plugin_smart_segmentation.streaming.wrapper import (
     find_stream_boundary,
     pop_stream_segments,
@@ -102,6 +104,17 @@ class TestStreamBoundary:
         assert segments == ["一句。", "两句。"]
         assert rest == ""
 
+    def test_hard_cut_keeps_following_newline(self) -> None:
+        """硬切位置上的换行不能丢：find_stream_boundary 只在窗口内找换行，
+        恰好落在 max_chars 处的换行只能靠 pop 的 lstrip 保住。"""
+        segments, rest = pop_stream_segments(
+            "x" * 90 + "\nnext",
+            min_chars=18,
+            max_chars=90,
+        )
+        assert segments == ["x" * 90]
+        assert rest == "\nnext"
+
     def test_pop_skips_whitespace_only_segments(self) -> None:
         assert pop_stream_segments("     ", min_chars=1, max_chars=3) == ([], "")
         assert pop_stream_segments("\n\n\nhello", min_chars=3, max_chars=90) == (
@@ -109,11 +122,58 @@ class TestStreamBoundary:
             "hello",
         )
 
+    def test_newline_run_cannot_pad_min_chars(self) -> None:
+        """min_chars 按内容字符计：长换行 run 会把原始长度垫过闸门，切出只有
+        两三个字的消息。此时应继续等待后续内容。"""
+        segments, rest = pop_stream_segments(
+            "好的" + "\n" * 20 + "后面",
+            min_chars=18,
+            max_chars=90,
+        )
+        assert segments == []
+        assert rest == "好的" + "\n" * 20 + "后面"  # 等待中不能丢内容
+
+    def test_leading_whitespace_cannot_pad_min_chars(self) -> None:
+        """段首空白同样不能把强句读符边界的长度垫过闸门。"""
+        text = "\n" * 11 + "？开、;吧;存。"
+        assert find_stream_boundary(text, min_chars=18, max_chars=90) is None
+
     def test_weak_boundary_before_min_no_cut(self) -> None:
         assert find_stream_boundary("你，好", min_chars=5, max_chars=90) is None
 
+    def test_weak_boundary_at_min_is_accepted(self) -> None:
+        """弱边界与强句读符/换行共用同一道 min 闸门：逗号恰好落在 min_chars-1
+        处时必须被接受，否则会退化成硬切。"""
+        text = "x" * 17 + "，" + "y" * 80
+        assert find_stream_boundary(text, min_chars=18, max_chars=90) == 18
+
     def test_hard_cut_at_max_without_boundary(self) -> None:
         assert find_stream_boundary("a" * 100, min_chars=10, max_chars=50) == 50
+
+    @pytest.mark.parametrize(
+        "cluster",
+        ["👨‍👩‍👧", "🇨🇳", "❤️", "👍🏽"],
+    )
+    def test_hard_cut_does_not_split_emoji_cluster(self, cluster: str) -> None:
+        """硬切落在字形簇中间会把一个 emoji 裂成两半。四类接缝各自钉：
+        ZWJ 序列、成对区域指示符（国旗）、变体选择符、肤色修饰符。"""
+        text = "a" * 89 + cluster + "b" * 5
+        boundary = find_stream_boundary(text, min_chars=18, max_chars=90)
+        assert boundary is not None
+        assert text[boundary:] == cluster + "b" * 5
+
+    def test_boundary_search_is_bounded_by_window(self) -> None:
+        """边界查找必须限定在 [min_chars, max_chars] 窗口内：全文扫描会让单个
+        大 chunk 的耗时随长度线性膨胀（实测差三个数量级）。"""
+        import time
+
+        text = "啊" * 300000  # 无任何边界：最坏情况
+        start = time.perf_counter()
+        for _ in range(20):
+            assert find_stream_boundary(text, min_chars=18, max_chars=90) == 90
+        elapsed = time.perf_counter() - start
+        # 窗口化实测 0.2ms，全文扫描实测 508ms：阈值取两者之间
+        assert elapsed < 0.05, f"find_stream_boundary 退化为全文扫描：{elapsed:.3f}s"
 
     def test_weak_boundary_picks_latest_not_first_declared(self) -> None:
         """弱边界应取最晚位置，而非常量声明顺序最靠前的（O-13）。"""

@@ -18,7 +18,7 @@ class FakeContext:
         self.delay = 0.0
         self.raise_cancelled = False
 
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         return self._provider_id
 
     async def llm_generate(self, **kwargs):
@@ -85,7 +85,7 @@ async def test_segment_no_provider_falls_back() -> None:
 
 
 class RaisingGenerateContext:
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         return "p1"
 
     async def llm_generate(self, **kwargs):
@@ -147,26 +147,23 @@ def test_brief_exception_formats_dict_result() -> None:
 
 
 class TypeErrorGenerateContext:
-    """llm_generate 声明接受 chat_provider_id，调用时却抛 TypeError（旧签名）。"""
+    """llm_generate 的签名与 astrbot 不一致（例如只收 prompt）时降级本地兜底。"""
 
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         return "p1"
 
-    async def llm_generate(self, **kwargs):
-        if "chat_provider_id" in kwargs:
-            raise TypeError("unexpected keyword argument 'chat_provider_id'")
+    async def llm_generate(self, prompt: str):
         return SimpleNamespace(completion_text='["a", "b"]')
 
 
 @pytest.mark.asyncio
-async def test_llm_generate_retries_prompt_only_on_type_error() -> None:
-    """带参调用被旧签名拒绝时必须退化为 prompt-only 重试一次。"""
+async def test_llm_generate_signature_mismatch_falls_back_locally() -> None:
+    """签名不匹配时按未支持处理：走本地规则兜底，不能把异常抛给 hook。"""
     segmenter = OutboundSegmenter(TypeErrorGenerateContext())  # type: ignore[arg-type]
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
     segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
-    # 本地兜底会得到 ["第一句", "第二句"]；走到重试才证明降级路径生效
-    assert segs == ["a", "b"]
+    assert segs == ["第一句", "第二句"]
 
 
 @pytest.mark.asyncio
@@ -191,25 +188,8 @@ async def test_segment_llm_receives_provider_id() -> None:
     assert ctx.generate_calls[0].get("chat_provider_id") == "p9"
 
 
-class PromptOnlyContext:
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
-        return "p1"
-
-    async def llm_generate(self, prompt: str):
-        return SimpleNamespace(completion_text='["a", "b"]')
-
-
-@pytest.mark.asyncio
-async def test_llm_generate_fallback_to_prompt_only() -> None:
-    segmenter = OutboundSegmenter(PromptOnlyContext())  # type: ignore[arg-type]
-    event = SimpleNamespace(unified_msg_origin="sess:1")
-    settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
-    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
-    assert segs == ["a", "b"]
-
-
 class TypeErrorProviderContext(FakeContext):
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         raise TypeError("signature mismatch")
 
 

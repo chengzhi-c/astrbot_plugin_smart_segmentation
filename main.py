@@ -18,10 +18,9 @@ from .chain_utils import (
 )
 from .follow_up import FollowUpDispatcher
 from .segmenter import OutboundSegmenter
-from .settings import SettingsLoader
+from .settings import SegmentationSettings, load_settings
 
 if TYPE_CHECKING:
-    from .settings import SegmentationSettings
     from .streaming.patches import StreamingPatchManager
 
 
@@ -31,7 +30,6 @@ class SmartSegmentationPlugin(Star):
         self.config = config if config is not None else {}
         self._stopping = False
         self._instance_token = uuid4().hex
-        self._settings = SettingsLoader(self.config)
         self._segmenter = OutboundSegmenter(context)
         self._follow_ups = FollowUpDispatcher(
             context,
@@ -48,6 +46,7 @@ class SmartSegmentationPlugin(Star):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            logger.debug("智能分段未启动流式补丁周期同步：当前没有运行中的事件循环")
             return
         self._sync_task = loop.create_task(self._sync_loop())
 
@@ -64,7 +63,7 @@ class SmartSegmentationPlugin(Star):
                 logger.debug("智能分段流式补丁周期同步失败: %s", exc)
 
     def _get_settings(self) -> SegmentationSettings | None:
-        return self._settings.get()
+        return load_settings(self.config)
 
     def _ensure_streaming(self) -> StreamingPatchManager:
         if self._streaming is None:
@@ -78,6 +77,10 @@ class SmartSegmentationPlugin(Star):
         return self._streaming
 
     def _sync_streaming(self, settings: SegmentationSettings | None) -> None:
+        if self._stopping:
+            # terminate 之后仍可能有 hook 在途：此时不能再装补丁，否则会重新挂上
+            # 一个没人卸载的闭包（同步任务已被取消）。
+            return
         enabled = bool(settings is not None and settings.streaming_compat_enabled)
         if not enabled and self._streaming is None:
             return
@@ -90,6 +93,11 @@ class SmartSegmentationPlugin(Star):
         if settings is None:
             return
         if self._follow_ups.is_session_guarded(event.unified_msg_origin):
+            # 上一轮补发进行中，本轮不分段。同时清掉可能残留的旧簿记：若上一轮
+            # 登记了 pending 但 RespondStage 被跳过，不清会让本轮
+            # after_message_sent 把那条 pending 当成本轮的发出去。
+            self._follow_ups.discard(self._follow_ups.pending_id_of(event))
+            self._follow_ups.clear_extras(event)
             return
 
         result = event.get_result()
@@ -158,14 +166,18 @@ class SmartSegmentationPlugin(Star):
         self._stopping = True
         self._segmenter.mark_stopping()
         self._follow_ups.mark_stopping()
-        if self._sync_task is not None and not self._sync_task.done():
-            self._sync_task.cancel()
-            try:
-                await self._sync_task
-            except asyncio.CancelledError:
-                pass
-        if self._streaming is not None:
-            self._streaming.mark_stopping()
-        await self._follow_ups.shutdown()
-        if self._streaming is not None:
-            self._streaming.sync(None)
+        try:
+            if self._sync_task is not None and not self._sync_task.done():
+                self._sync_task.cancel()
+                try:
+                    await self._sync_task
+                except asyncio.CancelledError:
+                    pass
+            if self._streaming is not None:
+                self._streaming.mark_stopping()
+            await self._follow_ups.shutdown()
+        finally:
+            # 补丁必须在本方法退出前卸掉：异常路径若跳过它，补丁会永久留在
+            # ResultDecorateStage 上，插件实例也随之无法回收。
+            if self._streaming is not None:
+                self._streaming.sync(None)

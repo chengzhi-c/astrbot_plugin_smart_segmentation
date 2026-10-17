@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import Any
-
-from astrbot.api import logger
 
 from .bounds import (
     ALLOWED_STYLES,
@@ -42,21 +40,23 @@ class SegmentationSettings:
 
 _DEFAULTS = SegmentationSettings()
 
-_CONFIG_KEYS = tuple(f.name for f in fields(SegmentationSettings))
-
 
 def _get_config_value(config: Any, key: str, default: Any) -> Any:
     try:
         if hasattr(config, "get"):
             return config.get(key, default)
-    except (TypeError, KeyError, AttributeError) as exc:
-        logger.debug("读取智能分段配置 %s 失败: %s", key, exc)
+    except Exception:
+        # 读配置失败必须降级：配置对象抛异常不能打断 hook 或补丁路径
+        pass
     return default
 
 
 def as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        # 手改 JSON 可能写成 1/0 甚至 1.0/0.0：按布尔处理，不要静默回落默认值
+        return bool(value)
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in {"1", "true", "yes", "on"}:
@@ -191,22 +191,3 @@ def load_settings(config: Any) -> SegmentationSettings | None:
         streaming_max_chars=streaming_max,
     )
 
-
-class SettingsLoader:
-    """Cache parsed settings while raw config values stay unchanged."""
-
-    def __init__(self, config: Any) -> None:
-        self._config = config if config is not None else {}
-        self._cached: SegmentationSettings | None = None
-        self._fingerprint: tuple[Any, ...] | None = None
-
-    def get(self) -> SegmentationSettings | None:
-        fingerprint = tuple(
-            _get_config_value(self._config, key, None) for key in _CONFIG_KEYS
-        )
-        if fingerprint == self._fingerprint:
-            return self._cached
-
-        self._cached = load_settings(self._config)
-        self._fingerprint = fingerprint
-        return self._cached

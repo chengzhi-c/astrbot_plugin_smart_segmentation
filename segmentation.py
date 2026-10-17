@@ -8,12 +8,14 @@ from typing import Any
 from .bounds import DELAY_JITTER_SECONDS
 
 THINKING_TAG_RE = re.compile(
-    r"<(?P<tag>think|thinking)\b[^>]*>.*?</(?P=tag)>",
+    # 开标签用 [^<>]* 而非 [^>]*：属性里的 "<" 极罕见，但后者会让"大量未闭合
+    # 开标签 + 一个闭合标签"的输入在每个起始位置回溯到文末（二次复杂度）。
+    r"<(?P<tag>think|thinking)\b[^<>]*>.*?</(?P=tag)>",
     flags=re.IGNORECASE | re.DOTALL,
 )
 THINKING_CLOSE_RE = re.compile(r"</(?:think|thinking)>", flags=re.IGNORECASE)
 UNCLOSED_THINKING_TAG_RE = re.compile(
-    r"^\s*<(?:think|thinking)\b[^>]*>.*?(?:$|(?=\n{2,}|\r\n\r\n))",
+    r"^\s*<(?:think|thinking)\b[^>]*>.*?(?:$|(?=\n{2,}|\r\n\r\n)|(?=</(?:think|thinking)>))",
     flags=re.IGNORECASE | re.DOTALL,
 )
 THINKING_BOUNDARY_RE = re.compile(
@@ -51,25 +53,49 @@ STYLE_GUIDES = {
 }
 
 
-def cap_segments(segments: list[str], *, max_segments: int) -> list[str]:
+def cap_segments(
+    segments: list[str],
+    *,
+    max_segments: int,
+    joiner: str,
+) -> list[str]:
+    """合并超出上限的尾部段。
+
+    `joiner` 必须是上游 stage 拆掉的分隔符：`_stage_lines` 按换行拆分并丢弃
+    分隔符，直接空串回并会把 markdown 列表/分步说明黏成一行。
+    """
     if max_segments <= 0 or len(segments) <= max_segments:
         return list(segments)
     head = segments[: max_segments - 1]
-    tail = "".join(segments[max_segments - 1 :])
+    tail = joiner.join(segments[max_segments - 1 :])
     return head + [tail]
+
+
+def _sub_before(pattern: re.Pattern[str], text: str, limit: int) -> str:
+    """pattern 的匹配不可能越过 limit：限制替换范围可避免未闭合开标签让每个
+    起始位置都回溯到文末（O(n^2)，阻塞事件循环）。"""
+    return pattern.sub("", text[:limit]) + text[limit:]
 
 
 def strip_thinking_content(text: str) -> str:
     if not text:
         return ""
     cleaned_text = str(text)
-    # THINKING_TAG_RE 右端必须是闭合标签：探不到闭合标签时它必然空转，但大量
-    # 未闭合开标签会让其回溯爆炸（O(n^2)，56k 字符约 2s，阻塞事件循环）。
-    # 先廉价探一次再决定是否执行该 sub（语义等价）。
-    if THINKING_CLOSE_RE.search(cleaned_text):
-        cleaned_text = THINKING_TAG_RE.sub("", cleaned_text)
+    # 三个标签形正则的匹配分别必然终止于闭合标签 / 文末 / ">"：把替换限制在
+    # "还可能含匹配的前缀"内即可消掉回溯。只探测"全文有无闭合标签"不够——
+    # 闭合标签之后的大量未闭合开标签、以及缺少 ">" 的开标签都仍会炸。
+    # （UNCLOSED_THINKING_TAG_RE 的 .*?$ 需要看到文末，必须替换全文。）
+    last_close_end = 0
+    for match in THINKING_CLOSE_RE.finditer(cleaned_text):
+        last_close_end = match.end()
+    if last_close_end:
+        cleaned_text = _sub_before(THINKING_TAG_RE, cleaned_text, last_close_end)
     cleaned_text = UNCLOSED_THINKING_TAG_RE.sub("", cleaned_text)
-    cleaned_text = THINKING_BOUNDARY_RE.sub("", cleaned_text)
+    cleaned_text = _sub_before(
+        THINKING_BOUNDARY_RE,
+        cleaned_text,
+        cleaned_text.rfind(">") + 1,
+    )
     return cleaned_text.strip()
 
 
@@ -89,6 +115,11 @@ def extract_json_array_text(raw_text: str) -> str:
         candidates.append(result_text[start : end + 1])
     if "```" in result_text:
         candidates.append(result_text.split("```", 1)[1].split("```", 1)[0].strip())
+    # 首个 "[" 之前若有别的 "["（对象包装、前缀引用），first..last 会拼成非法 JSON。
+    # 兜底再试一次最后一个 "["：放在 fence 之后，保留 fenced 数组的优先级。
+    last_start = result_text.rfind("[")
+    if last_start != -1 and end != -1 and last_start < end:
+        candidates.append(result_text[last_start : end + 1])
 
     for candidate in candidates:
         try:
@@ -226,7 +257,7 @@ def _stage_lines(segments: list[str]) -> list[str]:
         if is_action_only_text(s):
             result.append(s)
             continue
-        lines = [line.strip() for line in re.split(r"\r?\n+", s) if line.strip()]
+        lines = [line.strip() for line in re.split(r"(?:\r\n|\r|\n)+", s) if line.strip()]
         result.extend(lines)
     return result
 
@@ -262,7 +293,7 @@ def split_text_locally(text: str, *, max_segments: int) -> list[str]:
         return []
 
     pipeline = _stage_sentences(_stage_lines(_stage_bracket([cleaned])))
-    return cap_segments(pipeline, max_segments=max_segments)
+    return cap_segments(pipeline, max_segments=max_segments, joiner="\n")
 
 
 def normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
@@ -279,7 +310,7 @@ def normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
     if not normalized_segments:
         raise ValueError("模型返回的分段结果为空")
 
-    return cap_segments(normalized_segments, max_segments=max_segments)
+    return cap_segments(normalized_segments, max_segments=max_segments, joiner="\n")
 
 
 def build_segmentation_prompt(text: str, style: str, max_segments: int) -> str:
@@ -320,7 +351,7 @@ def parse_segments_from_model_output(
 
     balanced = merge_segments_balancing_brackets(normalized)
     pipeline = _stage_lines(_stage_bracket(balanced))
-    return cap_segments(pipeline, max_segments=max_segments)
+    return cap_segments(pipeline, max_segments=max_segments, joiner="\n")
 
 
 def calculate_send_delay(

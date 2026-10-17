@@ -8,33 +8,22 @@ PKG_NAME = "astrbot_plugin_smart_segmentation"
 
 _ROOT = Path(__file__).resolve().parents[1]
 
-# Locate the actual package directory (works even when the folder name is
-# not the package name, e.g. "<name>-main").
-_PKG_DIR = _ROOT
-if ( _ROOT / "segmentation.py" ).exists() and ( _ROOT / "main.py" ).exists():
-    _PKG_DIR = _ROOT
-else:
-    for child in _ROOT.parent.iterdir():
-        if (
-            child.is_dir()
-            and child.name.startswith(PKG_NAME)
-            and (child / "segmentation.py").exists()
-        ):
-            _PKG_DIR = child
-            break
+# GitHub zip 解出来的目录名是 "<name>-main"，与包名不一致：注册一个别名，
+# 让包内的相对导入能解析。目录名本就一致时无需别名，正常导入即可。
+if str(_ROOT.parent) not in sys.path:
+    sys.path.insert(0, str(_ROOT.parent))
 
-if str(_PKG_DIR.parent) not in sys.path:
-    sys.path.insert(0, str(_PKG_DIR.parent))
-
-# If the folder name differs from the package name, register an alias so
-# relative imports inside the package resolve correctly.
-if _PKG_DIR.name != PKG_NAME and PKG_NAME not in sys.modules:
+if _ROOT.name != PKG_NAME and PKG_NAME not in sys.modules:
+    init_file = _ROOT / "__init__.py"
+    if not init_file.exists():
+        raise RuntimeError(f"{PKG_NAME} 缺少 __init__.py：{init_file}")
     spec = importlib.util.spec_from_file_location(
         PKG_NAME,
-        _PKG_DIR / "__init__.py",
-        submodule_search_locations=[str(_PKG_DIR)],
+        init_file,
+        submodule_search_locations=[str(_ROOT)],
     )
-    if spec is not None and spec.loader is not None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[PKG_NAME] = module
-        spec.loader.exec_module(module)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法构造 {PKG_NAME} 的模块 spec：{init_file}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[PKG_NAME] = module
+    spec.loader.exec_module(module)

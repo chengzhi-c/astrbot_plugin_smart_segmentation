@@ -1,6 +1,6 @@
 # AstrBot 智能分段插件
 
-> 当前版本：v0.2.3（与 `metadata.yaml` 一致，变更见 [CHANGELOG](CHANGELOG.md)）
+> 当前版本：v0.2.4（与 `metadata.yaml` 一致，变更见 [CHANGELOG](CHANGELOG.md)）
 
 发送前把主 LLM 回复拆成更像真人聊天的多条消息：先发首段，再按延迟异步补发剩余段。
 
@@ -39,6 +39,8 @@ python -m pytest -q
 - 只处理 LLM/Agent 的纯文本（及 At+Plain）结果。
 - 模型超时、解析失败或无 provider 时走本地句读/括号规则兜底。
 - 补发走主动 `send_message`，不经普通回复管线的 after-hook（防递归；依赖该 hook 的统计插件可能看不到补发段）。
+- 补发中途发送失败时，未送出的段会合并为一条消息补发，避免用户拿到被截断的回复。
+- 同一会话的多轮补发串行发送，不会交错。
 - **流式兼容（C-light）**：开启后包装 AstrBot 流式结果并按标点/长度实时切段；**不再** patch 各平台 `send_streaming`。若某平台绕过 decorate 直发，流式分段不保证生效。
 - 流式默认关闭时，不 import、不安装任何补丁（仅留一个 30 秒配置同步循环）。
 - 流式兼容仅由 `streaming/patches.py` 的补丁路径承担；插件主处理器对流式结果不可达（astrbot 4.16-4.x `ResultDecorateStage` 对 `STREAMING_RESULT` 提前返回）。本设计基于 `metadata.yaml` 锁定的版本范围（`<5`）。
@@ -62,8 +64,9 @@ streaming/         # 可选流式兼容（懒加载；默认不装）
 
 依赖方向单向：`main` 只做装配；`segmenter` / `follow_up` / `chain_utils` /
 `streaming/patches` 依赖 `segmentation` / `settings` / `errors`；
-`streaming/wrapper` 的边界逻辑（`find_stream_boundary` / `pop_stream_segments`）只依赖
-`segmentation` 的标点常量、不 import 平台；`segmentation` 只依赖 `bounds`（纯领域层）。
+`streaming/wrapper` 只依赖 `segmentation` 的标点常量与 `settings`，不 import 平台；
+`segmentation` 与 `settings` 只依赖 `bounds`（纯领域层，可在没有 astrbot 的
+环境下单独测试）。
 
 ## 许可证
 

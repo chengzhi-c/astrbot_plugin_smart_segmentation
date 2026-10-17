@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
 from astrbot.api import logger
@@ -22,74 +19,23 @@ from .segmentation import (
 )
 from .settings import SegmentationSettings
 
-GenerateFn = Callable[..., Any]
-
-
-@dataclass(slots=True)
-class _ProviderApi:
-    get_id: GenerateFn | None = None
-    generate: GenerateFn | None = None
-    generate_supports_provider: bool = False
-    generate_supports_temperature: bool = False
-    generate_supports_max_tokens: bool = False
-    resolved: bool = False
-
-
-def _accepts_param(fn: Callable[..., Any], name: str) -> bool:
-    try:
-        sig = inspect.signature(fn)
-    except (TypeError, ValueError):
-        return False
-    if name in sig.parameters:
-        return True
-    return any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-    )
-
-
-async def _maybe_await(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
 
 def _is_current_task_cancelling() -> bool:
-    current_task = asyncio.current_task()
-    if current_task is None:
-        return False
-    cancelling = getattr(current_task, "cancelling", None)
-    if callable(cancelling):
-        return cancelling() > 0
-    return current_task.cancelled()
+    """区分"调用方取消"（必须上抛）与 provider 自己抛的 CancelledError（走兜底）。
+
+    astrbot 要求 Python >=3.12，`Task.cancelling()` 必然存在。
+    """
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 class OutboundSegmenter:
     def __init__(self, context: Context) -> None:
         self._context = context
-        self._api = _ProviderApi()
         self._stopping = False
 
     def mark_stopping(self) -> None:
         self._stopping = True
-
-    def _ensure_api(self) -> _ProviderApi:
-        api = self._api
-        if api.resolved:
-            return api
-
-        get_current = getattr(self._context, "get_current_chat_provider_id", None)
-        if callable(get_current):
-            api.get_id = get_current
-
-        generate = getattr(self._context, "llm_generate", None)
-        if callable(generate):
-            api.generate = generate
-            api.generate_supports_provider = _accepts_param(generate, "chat_provider_id")
-            api.generate_supports_temperature = _accepts_param(generate, "temperature")
-            api.generate_supports_max_tokens = _accepts_param(generate, "max_tokens")
-
-        api.resolved = True
-        return api
 
     async def segment(
         self,
@@ -152,23 +98,18 @@ class OutboundSegmenter:
         if settings.provider_id:
             return settings.provider_id
 
-        api = self._ensure_api()
-        if api.get_id is None:
+        # 缺失该方法时降级为本地规则：AttributeError 不能穿出 hook
+        get_current = getattr(self._context, "get_current_chat_provider_id", None)
+        if not callable(get_current):
             return ""
         umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         try:
-            if umo:
-                provider_id = await _maybe_await(api.get_id(umo=umo))
-            else:
-                provider_id = await _maybe_await(api.get_id())
-        except TypeError:
-            provider_id = None
+            provider_id = await get_current(umo=umo)
         except Exception as exc:
+            # 调用失败：放弃 provider 解析，本次分段走本地规则兜底
             logger.debug("获取当前会话 provider_id 失败: %s", exc)
             return ""
-        if provider_id:
-            return str(provider_id).strip()
-        return ""
+        return str(provider_id).strip() if provider_id else ""
 
     async def _segment_with_llm(
         self,
@@ -198,23 +139,14 @@ class OutboundSegmenter:
         prompt: str,
         settings: SegmentationSettings,
     ) -> Any:
-        api = self._ensure_api()
-        generate = api.generate
-        if generate is None:
+        generate = getattr(self._context, "llm_generate", None)
+        if not callable(generate):
             raise RuntimeError("当前 AstrBot Context 不支持 llm_generate")
-
-        kwargs: dict[str, Any] = {"prompt": prompt}
-        if api.generate_supports_provider and provider_id:
-            kwargs["chat_provider_id"] = provider_id
-        if api.generate_supports_temperature:
-            kwargs["temperature"] = settings.temperature
-        if api.generate_supports_max_tokens:
-            kwargs["max_tokens"] = settings.max_tokens
-
-        try:
-            return await _maybe_await(generate(**kwargs))
-        except TypeError:
-            # One fallback: prompt only (locked AstrBot major line).
-            if kwargs.keys() != {"prompt"}:
-                return await _maybe_await(generate(prompt=prompt))
-            raise
+        # astrbot >=4.16,<5 的 llm_generate 签名均为
+        # (*, chat_provider_id, prompt=None, ..., **kwargs)，下列参数全部收得下。
+        return await generate(
+            prompt=prompt,
+            chat_provider_id=provider_id,
+            temperature=settings.temperature,
+            max_tokens=settings.max_tokens,
+        )

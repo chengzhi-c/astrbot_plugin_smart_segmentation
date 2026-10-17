@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import pytest
 
+# 先导入 astrbot.api（它会完整初始化 astrbot.core.star）：astrbot 4.17.6 上直接
+# 导入 pipeline.result_decorate.stage 会触发 star 包的部分初始化 ImportError。
+import astrbot.api.star  # noqa: F401,E402
+
 pytest.importorskip("astrbot.core.pipeline.result_decorate.stage")
 
 from astrbot.api.event import MessageChain, MessageEventResult, ResultContentType  # noqa: E402
@@ -139,7 +143,7 @@ async def test_patched_process_delegates_non_streaming_to_original() -> None:
     内置分段回复、TTS 全部静默失效。
     """
     real_process = ResultDecorateStage.process
-    # 归一化补丁状态：前序测试文件可能在类上留下 _ORIGINAL_ATTR（设计如此），
+    # 归一化补丁状态：前序测试异常退出时可能在类上留下 _ORIGINAL_ATTR，
     # 不清掉的话下面的桩替换会被当成"外来修改"而跳过安装。
     pristine = getattr(ResultDecorateStage, _ORIGINAL_ATTR, real_process)
     if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):

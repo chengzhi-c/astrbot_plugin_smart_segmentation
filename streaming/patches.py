@@ -13,6 +13,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..chain_utils import is_streaming_result
+from ..errors import brief_exception
 from ..settings import SegmentationSettings
 from .wrapper import decorate_streaming_result
 
@@ -49,12 +50,23 @@ class StreamingPatchManager:
             settings = None
         want = bool(settings is not None and settings.streaming_compat_enabled)
         if want == self._desired_enabled and want == self._installed:
-            return
+            if not want or self._owns_current_patch():
+                return
+            # 补丁已被别的实例接管/还原，但 _installed 仍为 True：不纠正的话
+            # 周期同步会永远早退，流式兼容静默失效直到进程重启。
+            self._installed = False
         self._desired_enabled = want
         if want:
             self._install()
         else:
             self._restore()
+
+    def _owns_current_patch(self) -> bool:
+        holder = self._holder
+        if holder is None:
+            return False
+        current = getattr(holder, _TARGET_ATTR, None)
+        return getattr(current, _PATCH_OWNER_ATTR, None) == self._owner_token
 
     def _install(self) -> None:
         try:
@@ -63,12 +75,18 @@ class StreamingPatchManager:
             self._holder = ResultDecorateStage
             if not self._prepare_install():
                 return
+            self._apply_patch()
+        except Exception as exc:
+            logger.warning("智能分段流式兼容补丁启用失败: %s", exc, exc_info=True)
 
-            original = self._original
-            assert original is not None
-            manager = self
+    def _apply_patch(self) -> None:
+        original = self._original
+        if original is None:
+            return
+        manager = self
 
-            async def patched_process(stage_self, event: AstrMessageEvent):
+        async def patched_process(stage_self, event: AstrMessageEvent):
+            try:
                 result = event.get_result()
                 if is_streaming_result(result):
                     settings = manager._get_settings()
@@ -81,15 +99,20 @@ class StreamingPatchManager:
                                 event.unified_msg_origin,
                             ),
                         )
-                async for item in original(stage_self, event):
-                    yield item
+            except Exception as exc:
+                # 装饰失败不能让整条消息发不出去（补丁不在 handler 注册表里，
+                # 异常会穿过整个管线）：按未打补丁的语义继续。
+                logger.warning(
+                    "智能分段流式装饰失败，按未打补丁继续: %s",
+                    brief_exception(exc),
+                )
+            async for item in original(stage_self, event):
+                yield item
 
-            setattr(patched_process, _PATCH_OWNER_ATTR, self._owner_token)
-            setattr(ResultDecorateStage, _TARGET_ATTR, patched_process)
-            self._installed = True
-            logger.info("智能分段流式兼容补丁已启用")
-        except Exception as exc:
-            logger.warning("智能分段流式兼容补丁启用失败: %s", exc, exc_info=True)
+        setattr(patched_process, _PATCH_OWNER_ATTR, self._owner_token)
+        setattr(self._holder, _TARGET_ATTR, patched_process)
+        self._installed = True
+        logger.info("智能分段流式兼容补丁已启用")
 
     def _prepare_install(self) -> bool:
         holder = self._holder
@@ -137,6 +160,10 @@ class StreamingPatchManager:
                 == self._owner_token
             ):
                 setattr(holder, _TARGET_ATTR, original)
+                if getattr(holder, _ORIGINAL_ATTR, None) is original:
+                    # 必须清掉残留：留着它，之后任何替换 process 的代码都会被
+                    # 当成"外来修改"，后续合法安装全部被跳过。
+                    delattr(holder, _ORIGINAL_ATTR)
             else:
                 logger.debug("智能分段未恢复 %s：当前方法不属于本实例", _TARGET_LABEL)
         except Exception as exc:

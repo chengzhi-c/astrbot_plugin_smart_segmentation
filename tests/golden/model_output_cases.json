@@ -3,84 +3,142 @@
     "name": "plain_json",
     "raw": "[\"嗨\", \"在吗\"]",
     "max_segments": 5,
-    "expected": ["嗨", "在吗"]
+    "expected": [
+      "嗨",
+      "在吗"
+    ]
   },
   {
     "name": "fenced",
     "raw": "```json\n[\"先这样\", \"（点头）\", \"回头聊\"]\n```",
     "max_segments": 5,
-    "expected": ["先这样", "（点头）", "回头聊"]
+    "expected": [
+      "先这样",
+      "（点头）",
+      "回头聊"
+    ]
   },
   {
     "name": "fence_without_json_label",
     "raw": "```\n[\"一\", \"二\"]\n```",
     "max_segments": 5,
-    "expected": ["一", "二"]
+    "expected": [
+      "一",
+      "二"
+    ]
   },
   {
     "name": "model_forgot_bracket_split",
     "raw": "[\"正文（偷笑）结尾\"]",
     "max_segments": 5,
-    "expected": ["正文", "（偷笑）", "结尾"]
+    "expected": [
+      "正文",
+      "（偷笑）",
+      "结尾"
+    ]
   },
   {
     "name": "two_action_brackets",
     "raw": "[\"好（笑）坏（哭）\"]",
     "max_segments": 5,
-    "expected": ["好", "（笑）", "坏", "（哭）"]
+    "expected": [
+      "好",
+      "（笑）",
+      "坏",
+      "（哭）"
+    ]
   },
   {
     "name": "trailing_whitespace",
     "raw": "[\"a\", \"b\"]  \n",
     "max_segments": 5,
-    "expected": ["a", "b"]
+    "expected": [
+      "a",
+      "b"
+    ]
   },
   {
     "name": "non_string_items_skipped",
     "raw": "[\"a\", 123, [\"b\"], null, \"c\"]",
     "max_segments": 5,
-    "expected": ["a", "c"]
+    "expected": [
+      "a",
+      "c"
+    ]
   },
   {
     "name": "max_segments_one_degenerate",
     "raw": "[\"a\", \"b\", \"c\"]",
     "max_segments": 1,
-    "expected": ["abc"]
+    "expected": [
+      "a\nb\nc"
+    ]
   },
   {
     "name": "cap",
     "raw": "[\"a\", \"b\", \"c\", \"d\"]",
     "max_segments": 3,
-    "expected": ["a", "b", "cd"]
+    "expected": [
+      "a",
+      "b",
+      "c\nd"
+    ]
   },
   {
     "name": "trailing_garbage",
     "raw": "[\"a\", \"b\"] 以上是我的分段 垃圾",
     "max_segments": 5,
-    "expected": ["a", "b"]
+    "expected": [
+      "a",
+      "b"
+    ]
   },
   {
     "name": "unlabeled_fence_with_code",
     "raw": "```\nif ok:\n    pass\n[\"a\", \"b\"]\n```",
     "max_segments": 5,
-    "expected": ["a", "b"]
+    "expected": [
+      "a",
+      "b"
+    ]
   },
   {
     "name": "newline_in_item",
     "raw": "[\"a\\nb\", \"c\"]",
     "max_segments": 5,
-    "expected": ["a", "b", "c"]
+    "expected": [
+      "a",
+      "b",
+      "c"
+    ]
   },
   {
     "name": "ascii_brackets",
     "raw": "[\"(nod)\", \"hi\"]",
     "max_segments": 5,
-    "expected": ["(nod)", "hi"]
+    "expected": [
+      "(nod)",
+      "hi"
+    ]
   },
   {
     "name": "surplus_close_bracket_not_merged",
     "raw": "[\"你好）\", \"今天天气不错\", \"我们出去玩吧\"]",
     "max_segments": 5,
-    "expected": ["你好）", "今天天气不错", "我们出去玩吧"]
+    "expected": [
+      "你好）",
+      "今天天气不错",
+      "我们出去玩吧"
+    ]
+  },
+  {
+    "name": "cap_keeps_newline_in_merged_tail",
+    "raw": "[\"可以，步骤如下：\", \"1. 先安装依赖\", \"2. 再改配置文件\", \"3. 重启 AstrBot\"]",
+    "max_segments": 3,
+    "expected": [
+      "可以，步骤如下：",
+      "1. 先安装依赖",
+      "2. 再改配置文件\n3. 重启 AstrBot"
+    ]
   }
 ]

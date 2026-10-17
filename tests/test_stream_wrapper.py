@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -132,6 +131,25 @@ async def test_stream_realtime_splits_sentences() -> None:
         out.extend(texts)
     assert out[0] == "你好啊。"
     assert any("继续说。" in item for item in out)
+
+
+@pytest.mark.asyncio
+async def test_stream_flush_keeps_trailing_newline() -> None:
+    """中途 flush 只能剥空格/制表符：换行符是内容（平台无分隔符拼接各段），
+    剥掉它会把 markdown 列表/分步说明黏成一行。"""
+
+    async def gen():
+        yield MessageChain([Plain("- 甲\n")])
+        yield MessageChain([At(qq="1")])
+        yield MessageChain([Plain("- 乙\n")])
+
+    settings = SegmentationSettings(streaming_min_chars=100, streaming_max_chars=300)
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert _collected(collected) == [
+        ("plain", "- 甲\n"),
+        ("at", "1"),
+        ("plain", "- 乙\n"),
+    ]
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 
 def test_plain_chain_with_at() -> None:
     assert _is_plain_chain(MessageChain([At(qq="123"), Plain("x")])) is True
+    assert _is_plain_chain(MessageChain([Plain("x")])) is True
 
 
 def test_plain_chain_with_foreign_component() -> None:

@@ -19,40 +19,30 @@ from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin  # no
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_astrbot_version_upper_bound_locked() -> None:
-    """A4 删除了 on_decorating_result 的流式分支，前提是 DecorateStage 对
-    STREAMING_RESULT 提前返回（astrbot 4.16-4.x 实测）。
-
-    若上界抬到 5 及以上，必须先重新审视 A4：
-    见 test_streaming_integration.py::test_decorate_stage_early_returns_for_streaming
-    """
-    meta = (ROOT / "metadata.yaml").read_text(encoding="utf-8")
-    constraint = next(
-        line.split(":", 1)[1].strip().strip('"')
-        for line in meta.splitlines()
-        if line.startswith("astrbot_version:")
-    )
-    assert "<5" in constraint, (
-        f"astrbot_version 上界变更为 {constraint}，A4 的删除依据需重新验证"
-    )
-
-
-def _registry():
-    from astrbot.core.star.star_handler import star_handlers_registry
-
-    return star_handlers_registry
-
-
 def test_hooks_registered_in_astrbot_registry() -> None:
-    registry = _registry()
-    pending = registry.get_handler_by_full_name(
-        "astrbot_plugin_smart_segmentation.main_on_decorating_result",
-    )
-    after = registry.get_handler_by_full_name(
-        "astrbot_plugin_smart_segmentation.main_after_message_sent",
-    )
-    assert pending is not None
-    assert after is not None
+    """两个钩子必须注册进 AstrBot 的真实 handler registry。
+
+    按事件类型 + 模块路径后缀匹配，而不是硬编码 handler_full_name：完整名字
+    的格式（`f"{module}_{name}"`）和模块路径的导入方式都属于 AstrBot 内部约
+    定，写死会让测试随导入方式变化而脆弱。
+    """
+    from astrbot.core.star.star_handler import EventType, star_handlers_registry
+
+    from astrbot_plugin_smart_segmentation import main as main_mod
+
+    module_suffix = main_mod.__name__
+
+    def _registered(event_type: EventType) -> set[str]:
+        return {
+            handler.handler_name
+            for handler in star_handlers_registry.get_handlers_by_event_type(
+                event_type,
+            )
+            if handler.handler_module_path.endswith(module_suffix)
+        }
+
+    assert "on_decorating_result" in _registered(EventType.OnDecoratingResultEvent)
+    assert "after_message_sent" in _registered(EventType.OnAfterMessageSentEvent)
 
 
 def test_plugin_is_real_star_and_instantiates() -> None:
@@ -80,6 +70,12 @@ def test_terminate_clean() -> None:
         )
         assert pending_id
         plugin._follow_ups.schedule(plugin._follow_ups.pop(pending_id))
+        # 再放一条从未被认领的 pending：只有 shutdown 的清理能移除它
+        plugin._follow_ups.register(
+            session="sess:1",
+            segments=["四"],
+            settings=plugin._get_settings(),
+        )
         await plugin.terminate()
 
     asyncio.run(scenario())

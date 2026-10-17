@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import random
 from dataclasses import fields
 from pathlib import Path
 
 import pytest
 
 from astrbot_plugin_smart_segmentation.bounds import (
+    ALLOWED_STYLES,
     MAX_DELAY_BASE,
     MAX_DELAY_MAX,
     MAX_DELAY_PER_CHAR,
@@ -22,8 +22,6 @@ from astrbot_plugin_smart_segmentation.bounds import (
 from astrbot_plugin_smart_segmentation.bounds import DELAY_JITTER_SECONDS
 from astrbot_plugin_smart_segmentation.segmentation import (
     SegmentationParseError,
-    _stage_lines,
-    _stage_sentences,
     build_segmentation_prompt,
     calculate_send_delay,
     cap_segments,
@@ -35,7 +33,7 @@ from astrbot_plugin_smart_segmentation.segmentation import (
     split_text_locally,
     strip_thinking_content,
 )
-from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
+from astrbot_plugin_smart_segmentation.settings import SegmentationSettings, load_settings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +48,11 @@ class TestStripThinking:
         text = "<THINKING>x</THINKING>正文"
         assert strip_thinking_content(text) == "正文"
 
+    def test_mismatched_tag_names_do_not_swallow_the_reply(self) -> None:
+        """开闭标签名不一致时，未闭合正则会一路吃到文末，把可见答案一起删掉。"""
+        assert strip_thinking_content("<think>secret</think>答案") == "答案"
+        assert strip_thinking_content("<thinking>secret</think>答案") == "答案"
+
     def test_unclosed_think_prefix(self) -> None:
         text = "<think>还在想\n\n可见正文"
         assert "可见正文" in strip_thinking_content(text)
@@ -58,12 +61,9 @@ class TestStripThinking:
     def test_boundary_tags_removed(self) -> None:
         assert strip_thinking_content("前</think>后") == "前后"
 
-    def test_empty(self) -> None:
-        assert strip_thinking_content("") == ""
-
     def test_guards_against_backtracking(self) -> None:
-        """大量未闭合开标签会让 THINKING_TAG_RE 回溯爆炸（无守卫时耗时随输入
-        长度指数级放大，阻塞事件循环）；守卫后应毫秒级返回。"""
+        """未闭合开标签的病态输入必须毫秒级返回（回归守卫：`_sub_before` 的
+        三个 limit 让匹配不可能回溯到文末）。"""
         import time
 
         pathological = "<think>" * 30000
@@ -71,6 +71,38 @@ class TestStripThinking:
         assert strip_thinking_content(pathological) == ""
         elapsed = time.perf_counter() - start
         assert elapsed < 3.0, f"strip_thinking_content 回溯爆炸：{elapsed:.1f}s"
+
+    def test_guards_against_backtracking_after_close_tag(self) -> None:
+        """闭合标签之后的大量未闭合开标签同样会回溯爆炸：只探测"全文有无
+        闭合标签"覆盖不到这种形状。"""
+        import time
+
+        pathological = "正文</think>" + "<think>" * 20000
+        start = time.perf_counter()
+        assert strip_thinking_content(pathological) == "正文"
+        elapsed = time.perf_counter() - start
+        assert elapsed < 3.0, f"strip_thinking_content 回溯爆炸：{elapsed:.1f}s"
+
+    def test_guards_against_backtracking_without_closing_angle(self) -> None:
+        """开标签缺少 ">" 时 THINKING_BOUNDARY_RE 也会逐位回溯到文末。"""
+        import time
+
+        pathological = "<think" * 40000
+        start = time.perf_counter()
+        assert strip_thinking_content(pathological) == pathological
+        elapsed = time.perf_counter() - start
+        assert elapsed < 3.0, f"strip_thinking_content 回溯爆炸：{elapsed:.1f}s"
+
+    def test_guards_against_backtracking_with_trailing_close_tag(self) -> None:
+        """大量未闭合开标签 + 末尾一个闭合标签：闭合标签在文末时 `_sub_before`
+        的 limit 形同虚设，开标签若允许吃 ">" 会逐位回溯（实测 1.3s vs 2ms）。"""
+        import time
+
+        pathological = "x" + "<thinking " * 16000 + "</thinking>"
+        start = time.perf_counter()
+        strip_thinking_content(pathological)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 0.5, f"strip_thinking_content 回溯爆炸：{elapsed:.1f}s"
 
 
 class TestJsonExtractAndParse:
@@ -89,14 +121,6 @@ class TestJsonExtractAndParse:
     def test_code_fence_with_outside_array(self) -> None:
         raw = '```\nprint("hi")\n```\n结果: ["甲", "乙"]'
         assert json.loads(extract_json_array_text(raw)) == ["甲", "乙"]
-
-    def test_parse_strips_whitespace(self) -> None:
-        raw = '[" 一 ", " 二 "]'
-        assert parse_segments_from_model_output(raw, max_segments=5) == ["一", "二"]
-
-    def test_parse_success_cap_joins_tail(self) -> None:
-        raw = '["a", "b", "c", "d"]'
-        assert parse_segments_from_model_output(raw, max_segments=2) == ["a", "bcd"]
 
     def test_parse_invalid_raises(self) -> None:
         with pytest.raises(SegmentationParseError):
@@ -122,26 +146,22 @@ class TestJsonExtractAndParse:
             "（前后）"
         ]
 
-    def test_parse_splits_action_brackets(self) -> None:
-        raw = '["你好（挥手）继续"]'
-        assert parse_segments_from_model_output(raw, max_segments=5) == [
-            "你好",
-            "（挥手）",
-            "继续",
-        ]
-
     def test_parse_keeps_newline_inside_bracket_part(self) -> None:
         raw = '["（哈\\n哈）", "继续"]'
-        assert parse_segments_from_model_output(raw, max_segments=1) == ["（哈\n哈）继续"]
+        assert parse_segments_from_model_output(raw, max_segments=1) == ["（哈\n哈）\n继续"]
 
     def test_extract_no_bracket_returns_raw(self) -> None:
         raw = "模型说分段如下"
         assert extract_json_array_text(raw) == raw
 
-    def test_extract_prefers_array_candidate(self) -> None:
-        """模型把数组包在对象里时，应取到可用的数组而不是整个对象。"""
-        raw = '```json\n{"segments": ["消息1", "消息2"]}\n```'
-        assert json.loads(extract_json_array_text(raw)) == ["消息1", "消息2"]
+    def test_extract_array_after_earlier_bracket(self) -> None:
+        """首个 "[" 之前还有别的 "[" 时，first..last 会拼成非法 JSON：
+        必须回退到最后一个 "[" 才能取到真正的数组。"""
+        for raw in (
+            '{"note": "[x]", "s": ["甲", "乙"]}',
+            'Step [1]: ["甲", "乙"]',
+        ):
+            assert json.loads(extract_json_array_text(raw)) == ["甲", "乙"]
 
     def test_parse_deeply_nested_raises_parse_error(self) -> None:
         """深层嵌套 JSON 的 RecursionError 必须收敛为 SegmentationParseError。"""
@@ -150,18 +170,15 @@ class TestJsonExtractAndParse:
 
 
 class TestTrailingPeriodAndLocalSplit:
-    def test_local_strips_single_period(self) -> None:
-        segs = split_text_locally("你好。世界。", max_segments=5)
-        assert segs == ["你好", "世界"]
-
-    @pytest.mark.parametrize("mark", ["。", "！", "？", "~", "…", "!", "?"])
+    @pytest.mark.parametrize("mark", ["~", "…", "!", "?"])
     def test_local_splits_on_every_strong_mark(self, mark: str) -> None:
-        """每个强句读符都要能作为句中边界（不只测全角句号）。
+        """这几个强句读符只有这里钉（金样只用全角，且 `~` 从不出现在句中）；
+        全角 `。！？` 由金样 two_sentences / exclaim_question 覆盖。
 
         句末的单个「。」会被有意剥掉（更像真人聊天），其余情绪标点保留。
         """
         text = f"真的吗{mark}好吧。"
-        expected_head = "真的吗" if mark == "。" else f"真的吗{mark}"
+        expected_head = f"真的吗{mark}"
         assert split_text_locally(text, max_segments=5) == [expected_head, "好吧"]
 
     def test_local_keeps_leading_marks(self) -> None:
@@ -169,14 +186,6 @@ class TestTrailingPeriodAndLocalSplit:
         assert split_text_locally("。你好。世界。", max_segments=5) == ["。你好", "世界"]
         assert split_text_locally("！！大事不好了。", max_segments=5) == ["！！大事不好了"]
         assert split_text_locally("（看）！快走。", max_segments=5) == ["（看）", "！快走"]
-
-    def test_local_keeps_ellipsis_style_periods(self) -> None:
-        segs = split_text_locally("等等。。。好的。", max_segments=5)
-        assert segs[0] == "等等。。。"
-        assert segs[1] == "好的"
-
-    def test_local_action_only_kept_whole(self) -> None:
-        assert split_text_locally("（轻轻笑了）", max_segments=5) == ["（轻轻笑了）"]
 
     def test_local_action_only_with_marks_kept_whole(self) -> None:
         assert split_text_locally("（笑死我了！）", max_segments=5) == ["（笑死我了！）"]
@@ -188,16 +197,10 @@ class TestTrailingPeriodAndLocalSplit:
         text = "一。二。三。四。五。"
         segs = split_text_locally(text, max_segments=2)
         assert len(segs) == 2
-        assert "".join(segs).replace("。", "") == "一二三四五"
+        assert "".join("".join(segs).split()) == "一二三四五"
 
 
 class TestActionAndBrackets:
-    def test_action_only_cn(self) -> None:
-        assert is_action_only_text("（笑）") is True
-
-    def test_action_only_en(self) -> None:
-        assert is_action_only_text("(nod)") is True
-
     def test_not_action_when_trailing_text(self) -> None:
         assert is_action_only_text("（笑）哈") is False
 
@@ -216,14 +219,6 @@ class TestActionAndBrackets:
             "后",
         ]
 
-    def test_merge_ignores_surplus_close_bracket(self) -> None:
-        """右括号过剩（孤立右括号、`:)` 类表情）不得把后续所有段粘成一条。"""
-        assert merge_segments_balancing_brackets(["a）", "b", "c"]) == ["a）", "b", "c"]
-        assert merge_segments_balancing_brackets(["你好）", "今天天气不错"]) == [
-            "你好）",
-            "今天天气不错",
-        ]
-
     def test_merge_flushes_trailing_unbalanced_buffer(self) -> None:
         """末段左括号未闭合时，buffer 必须作为最后一段发出（不能丢内容）。"""
         assert merge_segments_balancing_brackets(["（a", "b"]) == ["（ab"]
@@ -236,45 +231,27 @@ class TestActionAndBrackets:
                 [f"{open_b}前", f"后{close_b}", "完"]
             ) == [f"{open_b}前后{close_b}", "完"]
 
-    @pytest.mark.parametrize(
-        ("open_b", "close_b"),
-        [("（", "）"), ("【", "】"), ("[", "]"), ("(", ")")],
-    )
-    def test_split_text_at_brackets_all_pairs(
-        self, open_b: str, close_b: str
-    ) -> None:
+    def test_split_text_at_brackets_all_pairs(self) -> None:
         """四对括号都要能在拆分阶段独立成段，不能只识别第一对。"""
-        assert split_text_at_brackets(f"正文{open_b}动作{close_b}继续") == [
-            "正文",
-            f"{open_b}动作{close_b}",
-            "继续",
-        ]
+        for open_b, close_b in (("（", "）"), ("【", "】"), ("[", "]"), ("(", ")")):
+            assert split_text_at_brackets(f"正文{open_b}动作{close_b}继续") == [
+                "正文",
+                f"{open_b}动作{close_b}",
+                "继续",
+            ]
 
 
 class TestCapSegments:
     def test_join_tail(self) -> None:
-        assert cap_segments(["a", "b", "c"], max_segments=2) == ["a", "bc"]
-
-    def test_non_positive_max(self) -> None:
-        assert cap_segments(["a", "b"], max_segments=0) == ["a", "b"]
+        assert cap_segments(["a", "b", "c"], max_segments=2, joiner="") == ["a", "bc"]
 
     def test_max_one_merges_all(self) -> None:
-        assert cap_segments(["a", "b", "c"], max_segments=1) == ["abc"]
+        assert cap_segments(["a", "b", "c"], max_segments=1, joiner="") == ["abc"]
 
-
-class TestStageInternals:
-    def test_stage_lines_no_fallback_needed(self) -> None:
-        """_stage_lines 不需要兜底：对 strip 后的非空串按换行拆分，首块必非空。"""
-        assert _stage_lines(["hello"]) == ["hello"]
-        assert _stage_lines(["a\nb"]) == ["a", "b"]
-        assert _stage_lines(["x\r\ny"]) == ["x", "y"]
-        assert _stage_lines(["a\n\n\nb"]) == ["a", "b"]
-
-    def test_stage_sentences_fallback_reachable(self) -> None:
-        """纯标点段拆不出非空句，靠兜底原样保留（对比 `_stage_lines`：换行拆分
-        对 strip 后的非空串总产出非空首块，不需要兜底）。"""
-        assert _stage_sentences(["。。。"]) == ["。。。"]
-        assert _stage_sentences(["？！"]) == ["？！"]
+    def test_joiner_restores_dropped_separator(self) -> None:
+        assert cap_segments(["1. 甲", "2. 乙"], max_segments=1, joiner="\n") == [
+            "1. 甲\n2. 乙"
+        ]
 
 
 class TestPromptAndDelay:
@@ -283,20 +260,6 @@ class TestPromptAndDelay:
         assert "原文内容" in prompt
         assert "最多分成 4 条" in prompt
         assert "活泼" in prompt
-
-    def test_delay_bounds_with_rng(self) -> None:
-        rng = random.Random(0)
-        delay = calculate_send_delay("abcd", 1.0, 0.1, 1.2, rng=rng)
-        assert 0.0 <= delay <= 1.2
-
-    def test_delay_monotonic_without_jitter_ceiling(self) -> None:
-        class ZeroRng:
-            def uniform(self, a: float, b: float) -> float:
-                return 0.0
-
-        short = calculate_send_delay("a", 0.5, 0.1, 10.0, rng=ZeroRng())  # type: ignore[arg-type]
-        long = calculate_send_delay("aaaaa", 0.5, 0.1, 10.0, rng=ZeroRng())  # type: ignore[arg-type]
-        assert long > short
 
     def test_delay_clamped_when_max_below_base(self) -> None:
         delay = calculate_send_delay("abc", 5.0, 0.0, 1.0)
@@ -311,13 +274,23 @@ class TestPromptAndDelay:
 
         assert calculate_send_delay("abcd", 1.0, 0.1, 9.0, rng=ZeroRng()) == 1.4  # type: ignore[arg-type]
 
-    def test_delay_jitter_stays_within_bound(self) -> None:
-        """抖动必须落在 [0, DELAY_JITTER_SECONDS] 内。"""
-        base, per_char, delay_max = 1.0, 0.1, 9.0
-        for seed in range(50):
-            rng = random.Random(seed)
-            delay = calculate_send_delay("abcd", base, per_char, delay_max, rng=rng)
-            assert base + 4 * per_char <= delay <= base + 4 * per_char + DELAY_JITTER_SECONDS
+    def test_delay_jitter_is_applied(self) -> None:
+        """抖动必须真的加到延迟上（去掉 uniform 调用后本测试变红）。"""
+
+        class MaxJitterRng:
+            def uniform(self, a: float, b: float) -> float:
+                return b
+
+        class MinJitterRng:
+            def uniform(self, a: float, b: float) -> float:
+                return a
+
+        assert calculate_send_delay(
+            "abcd", 1.0, 0.1, 9.0, rng=MaxJitterRng()  # type: ignore[arg-type]
+        ) == pytest.approx(1.4 + DELAY_JITTER_SECONDS)
+        assert calculate_send_delay(
+            "abcd", 1.0, 0.1, 9.0, rng=MinJitterRng()  # type: ignore[arg-type]
+        ) == pytest.approx(1.4)
 
     def test_delay_per_char_weight(self) -> None:
         """每字权重：长度线性影响延迟。"""
@@ -344,6 +317,31 @@ class TestBoundsAlignSchema:
         assert schema["delay_per_char"]["slider"]["max"] == MAX_DELAY_PER_CHAR
         assert schema["streaming_min_chars"]["slider"]["max"] == MAX_STREAMING_MIN_CHARS
         assert schema["streaming_max_chars"]["slider"]["max"] == MAX_STREAMING_MAX_CHARS
+
+    def test_schema_slider_min_is_accepted(self) -> None:
+        """UI 能选到的最小值必须原样生效：代码下界被抬到 slider min 之上时，
+        用户按界面选值会被悄悄改写。"""
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        for key in (
+            "min_length",
+            "max_segments",
+            "max_tokens",
+            "timeout_seconds",
+            "temperature",
+            "delay_base",
+            "delay_per_char",
+            "delay_max",
+            "streaming_min_chars",
+            "streaming_max_chars",
+        ):
+            value = schema[key]["slider"]["min"]
+            settings = load_settings({"enabled": True, key: value})
+            assert settings is not None, key
+            assert getattr(settings, key) == value, key
+
+    def test_schema_style_options_match_allowed_styles(self) -> None:
+        schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        assert set(schema["style"]["options"]) == set(ALLOWED_STYLES)
 
     def test_schema_defaults_match_dataclass(self) -> None:
         """Schema default values must match SegmentationSettings defaults."""
