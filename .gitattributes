@@ -1,0 +1,9 @@
+# 统一行尾为 LF：避免打包交付时出现混合行尾
+* text=auto eol=lf
+
+# 显式按二进制处理的文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary

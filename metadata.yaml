@@ -1,0 +1,11 @@
+name: astrbot_plugin_smart_segmentation
+display_name: 智能分段
+desc: 把 AstrBot 的长回复像真人聊天那样拆成几条消息发出,首段立刻发,其余按节奏补发。
+version: v0.2.5
+author: chengzhi-c
+repo: https://github.com/chengzhi-c/astrbot_plugin_smart_segmentation
+astrbot_version: ">=4.16,<5"
+tags:
+  - segmentation
+  - llm
+  - reply
