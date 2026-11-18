@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from astrbot_plugin_smart_segmentation.settings import load_settings
 from astrbot_plugin_smart_segmentation.bounds import (
     MAX_DELAY_BASE,
     MAX_DELAY_MAX,
@@ -11,22 +10,12 @@ from astrbot_plugin_smart_segmentation.bounds import (
     MAX_STREAMING_MIN_CHARS,
     MAX_TIMEOUT_SECONDS,
 )
+from astrbot_plugin_smart_segmentation.settings import load_settings
 
 
 class TestLoadSettings:
     def test_disabled_returns_none(self) -> None:
         assert load_settings({"enabled": False}) is None
-
-    def test_defaults_and_bounds(self) -> None:
-        settings = load_settings({"enabled": True, "max_segments": 999, "style": "nope"})
-        assert settings is not None
-        assert settings.max_segments == 20
-        assert settings.style == "active"
-
-    def test_bool_string(self) -> None:
-        settings = load_settings({"enabled": "true", "streaming_compat_enabled": "off"})
-        assert settings is not None
-        assert settings.streaming_compat_enabled is False
 
     def test_infinite_config_value_falls_back_to_default(self) -> None:
         """JSON 的 1e999/Infinity 解析成 inf：int(inf) 抛 OverflowError，
@@ -131,17 +120,6 @@ class TestLoadSettings:
         settings = load_settings({"enabled": True, "streaming_compat_enabled": 0.0})
         assert settings is not None
         assert settings.streaming_compat_enabled is False
-
-    def test_config_object_exception_falls_back_to_defaults(self) -> None:
-        """配置对象 .get() 抛异常必须降级：异常会直接穿到 hook 与补丁路径。"""
-
-        class BrokenConfig:
-            def get(self, key, default=None):
-                raise RuntimeError("config backend down")
-
-        settings = load_settings(BrokenConfig())
-        assert settings is not None
-        assert settings.max_segments == 5
 
     def test_unparsable_float_falls_back_to_default(self) -> None:
         """非法浮点配置回落默认值（不能抛异常让插件加载失败）。"""

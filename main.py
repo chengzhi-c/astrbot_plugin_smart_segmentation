@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -16,7 +17,9 @@ from .chain_utils import (
     is_model_text_result,
     replace_plain_text_chain,
 )
+from .errors import brief_exception
 from .follow_up import FollowUpDispatcher
+from .segmentation import has_visible_text
 from .segmenter import OutboundSegmenter
 from .settings import SegmentationSettings, load_settings
 
@@ -31,7 +34,7 @@ _SENT_TEXTS_EXTRA_KEY = "_send_message_to_user_current_session_plain_texts"
 # 宿主 RespondStage 在流式回复结束后置位：之后再出现的结果一律不再发送。
 _STREAMING_FINISHED_EXTRA_KEY = "_streaming_finished"
 
-# 宿主自己对这几个平台跳过内置分段回复（result_decorate/stage.py 的平台判断）。
+# 宿主自己对这几个平台跳过内置分段回复。
 _HOST_SEGMENT_EXEMPT_PLATFORMS = (
     "qq_official_webhook",
     "weixin_official_account",
@@ -60,11 +63,9 @@ class SmartSegmentationPlugin(Star):
         """流式路径上没有可用 hook（DecorateStage/RespondStage 均提前返回），
         补丁的装卸不能只靠消息事件驱动，需要独立的周期同步。"""
         try:
-            loop = asyncio.get_running_loop()
+            self._sync_task = asyncio.get_running_loop().create_task(self._sync_loop())
         except RuntimeError:
             logger.debug("智能分段未启动流式补丁周期同步：当前没有运行中的事件循环")
-            return
-        self._sync_task = loop.create_task(self._sync_loop())
 
     async def _sync_loop(self) -> None:
         while not self._stopping:
@@ -73,13 +74,14 @@ class SmartSegmentationPlugin(Star):
                 if self._stopping:
                     return
                 self._sync_streaming(self._get_settings())
-                # 顺带兜底交付过期未认领的补发段：交接钩子没触发时（第三方插件只
-                # 在 DELIVERED 后调、宿主判空跳过）没有别的地方能回收它。
+                # 顺带兜底交付过期未认领的补发段：交接钩子没触发时（发送流程根本没
+                # 走到 after_message_sent，例如别的插件在装饰阶段就停掉了事件）没有
+                # 别的地方能回收它。
                 self._follow_ups.reap_expired()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.debug("智能分段流式补丁周期同步失败: %s", exc)
+                logger.debug("智能分段流式补丁周期同步失败: %s", brief_exception(exc))
 
     def _get_settings(self) -> SegmentationSettings | None:
         return load_settings(self.config)
@@ -108,15 +110,10 @@ class SmartSegmentationPlugin(Star):
         自己切不切，管不到我们换链之后的短首段），段数膨胀、分段边界被销毁、补发还
         被宿主的逐条间隔拖后。宿主没有单条结果的开关，只能在调用侧整体让位。
         """
-        get_platform_name = getattr(event, "get_platform_name", None)
-        if callable(get_platform_name):
-            if get_platform_name() in _HOST_SEGMENT_EXEMPT_PLATFORMS:
-                return False
-        get_config = getattr(self.context, "get_config", None)
-        if not callable(get_config):
+        if event.get_platform_name() in _HOST_SEGMENT_EXEMPT_PLATFORMS:
             return False
         try:
-            config = get_config(event.unified_msg_origin)
+            config = self.context.get_config(event.unified_msg_origin)
             platform_settings = config.get("platform_settings", {}) or {}
             segmented = platform_settings.get("segmented_reply", {}) or {}
         except Exception:
@@ -150,34 +147,31 @@ class SmartSegmentationPlugin(Star):
         self._sync_streaming(settings)
         if settings is None:
             return
-        if self._follow_ups.is_session_guarded(event.unified_msg_origin):
-            # 上一轮补发进行中，本轮不分段。同时清掉可能残留的旧簿记：若上一轮
-            # 登记了 pending 但 RespondStage 被跳过，不清会让本轮
-            # after_message_sent 把那条 pending 当成本轮的发出去。
-            # 注意：剩余段排在串行链后面，而本轮整条回复由宿主直接发出，不排在链里，
-            # 因此旧内容可能落在这条新回复之后——不能为了顺序去阻塞回复。
+        is_guarded = self._follow_ups.is_session_guarded(event.unified_msg_origin)
+        if is_guarded:
+            # 上一轮补发进行中，本轮不分段。剩余段排在串行链后面，而本轮整条回复
+            # 由宿主直接发出、不排在链里，旧内容可能落在这条新回复之后——不能为了
+            # 顺序去阻塞回复。
             self._follow_ups.flush_stale(self._follow_ups.pending_id_of(event))
             self._follow_ups.clear_extras(event)
-            return
 
         result = event.get_result()
-
         if self._follow_ups.is_result_applied(event, result):
             logger.debug("智能分段跳过：当前发送结果已经处理过")
             return
 
-        # 本轮结果没登记过，残留簿记只可能属于上一轮。上一轮可能因 RespondStage
-        # 判空 / 抽走 Reply-At 后链为空而根本没发出去，after_message_sent 不触发，
-        # pending 会一直挂在事件上；不清掉，本轮发送成功后就会认领它，把上一轮
-        # 剩下的段补发到这一轮（内容串轮）。
-        stale_id = self._follow_ups.pending_id_of(event)
-        if stale_id:
-            self._follow_ups.flush_stale(stale_id)
-            self._follow_ups.clear_extras(event)
+        # 本轮结果没登记过，残留簿记只可能属于上一轮。上一轮可能登记了 pending 却
+        # 没走到 after_message_sent（RespondStage 判空、抽走 Reply-At 后链为空、
+        # 第三方插件提前停掉事件），不清会让本轮发送成功后认领它，把上一轮剩下的
+        # 段补发到这一轮。
+        if not is_guarded:
+            stale_id = self._follow_ups.pending_id_of(event)
+            if stale_id:
+                self._follow_ups.flush_stale(stale_id)
+                self._follow_ups.clear_extras(event)
 
         if result is None or not is_model_text_result(result):
             return
-
         if event.get_extra(_STREAMING_FINISHED_EXTRA_KEY, False):
             # 流式回复已经发完，第三方插件又把结果改回 LLM_RESULT：宿主 RespondStage
             # 会直接 return（不发、也不触发 after_message_sent），此时分段只会让剩余段
@@ -186,23 +180,23 @@ class SmartSegmentationPlugin(Star):
             return
 
         outbound_text = extract_plain_text_chain(result)
-        if not outbound_text:
-            return
+        has_thinking_marker = "<think" in self._plain_text_of(result).lower()
 
-        sent_texts = self._host_already_sent_texts(event)
-        if sent_texts:
-            plain_text = self._plain_text_of(result)
-            if plain_text and plain_text in sent_texts:
-                # 原文命中：宿主内置分段关闭时它自己的比对也会命中，交给它抑制。不能动链——
-                # 换掉文本它的比对对象就变了，抑制反而失效；换链后只剩首段也是同样问题。
-                logger.debug("智能分段跳过：该文本已由 send_message_to_user 发出")
-                return
-            if outbound_text in sent_texts:
-                # 只有剥离 think 后的正文命中：宿主比对的是未剥离的原文，抑制不了。
-                # 把链归一成正文，至少不会把 think 原文发给用户；让位分支也要归一。
-                logger.debug("智能分段跳过：正文已由 send_message_to_user 发出")
+        def apply_outbound_text() -> None:
+            """有 think 原文时把链归一成剥离后的正文。"""
+            if has_thinking_marker:
                 replace_plain_text_chain(result, outbound_text)
-                return
+
+        if not has_visible_text(outbound_text):
+            # 能走到这里的一定是纯文本链（非纯文本链在 is_model_text_result 就被
+            # 挡回、链原样留给宿主），所以清链只吞掉 think/零宽这类空回复。
+            result.chain.clear()
+            return
+        if is_guarded:
+            apply_outbound_text()
+            return
+        if self._already_sent(event, result, outbound_text, apply_outbound_text):
+            return
 
         if self._host_segmented_reply_enabled(event):
             if not self._warned_builtin_segmentation:
@@ -212,27 +206,27 @@ class SmartSegmentationPlugin(Star):
                     "(两处同时切分会把消息条数放大、顺序打乱)。"
                     "请在 AstrBot 配置 → 平台设置 → 分段回复 中关闭它。",
                 )
-            plain_text = self._plain_text_of(result)
-            if "<think" in plain_text.lower():
-                # 让位时也要摘掉 think 原文：宿主会直接按链文本切分发给用户。
-                # 原文命中「已发文本」的情形已在上面 return（改链会让宿主抑制失效）。
-                replace_plain_text_chain(result, outbound_text)
+            # 让位时也要摘掉 think 原文：宿主会直接按链文本切分发给用户。
+            # 原文命中「已发文本」的情形已在上一步 return（改链会让宿主抑制失效）。
+            apply_outbound_text()
             return
 
         if self._stopping:
             # 停止中不要再打一次分段模型：既浪费额度，也会拖住卸载。
+            apply_outbound_text()
             return
         segments = await self._segmenter.segment(event, outbound_text, settings)
         if not segments:
+            apply_outbound_text()
             return
         if self._stopping:
             # terminate 可能落在分段调用期间：此时替换链会被 after_message_sent
-            # 丢弃补发，用户只看到首段。停止中保持原样发送。
+            # 丢弃补发，用户只看到首段。停止中保留清理过的正文。
             logger.debug("智能分段跳过：插件正在停止")
+            apply_outbound_text()
             return
 
         first_segment = segments[0]
-        follow_up_segments = segments[1:]
         # 先换链再登记是刻意顺序：登记成功但换链失败会造成补发 + 原链全文
         # 重复发送，比当前的失败模式（补发缺失）更差。
         if not replace_plain_text_chain(result, first_segment):
@@ -240,15 +234,41 @@ class SmartSegmentationPlugin(Star):
 
         pending_id = self._follow_ups.register(
             session=event.unified_msg_origin,
-            segments=follow_up_segments,
+            segments=segments,
             settings=settings,
         )
         self._follow_ups.mark_pending(event, pending_id, result)
+        self._follow_ups.track_first_send(event)
         logger.debug(
             "智能分段:共 %s 段,其中 %s 段稍后补发",
             len(segments),
-            len(follow_up_segments),
+            len(segments) - 1,
         )
+
+    def _already_sent(
+        self,
+        event: AstrMessageEvent,
+        result: Any,
+        outbound_text: str,
+        apply_outbound_text: Callable[[], None],
+    ) -> bool:
+        """结果已由 ``send_message_to_user`` 发往当前会话时跳过分段。
+
+        原文命中时不动链：宿主自己的比对能命中，换文本反而让抑制失效。只有剥离
+        think 后的正文命中时才归一链，避免把 think 原文发出去。
+        """
+        sent_texts = self._host_already_sent_texts(event)
+        if not sent_texts:
+            return False
+        plain_text = self._plain_text_of(result)
+        if plain_text and plain_text in sent_texts:
+            logger.debug("智能分段跳过：该文本已由 send_message_to_user 发出")
+            return True
+        if outbound_text in sent_texts:
+            logger.debug("智能分段跳过：正文已由 send_message_to_user 发出")
+            apply_outbound_text()
+            return True
+        return False
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
@@ -264,12 +284,16 @@ class SmartSegmentationPlugin(Star):
             self._follow_ups.clear_extras(event)
             return
 
+        first_send_delivered = self._follow_ups.first_send_delivered(event)
         pending = self._follow_ups.pop(pending_id)
         self._follow_ups.clear_extras(event)
         if pending is None or not pending.segments:
             return
 
-        self._follow_ups.schedule(pending)
+        self._follow_ups.schedule(
+            pending,
+            start_index=1 if first_send_delivered else 0,
+        )
 
     async def terminate(self) -> None:
         self._stopping = True

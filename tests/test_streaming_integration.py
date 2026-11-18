@@ -6,21 +6,13 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
-
-# 先导入 astrbot.api（它会完整初始化 astrbot.core.star）：astrbot 4.17.6 上直接
-# 导入 pipeline.result_decorate.stage 会触发 star 包的部分初始化 ImportError。
-import astrbot.api.star  # noqa: F401,E402
-
-pytest.importorskip("astrbot.core.pipeline.result_decorate.stage")
-
-from astrbot.api.event import MessageChain, MessageEventResult, ResultContentType  # noqa: E402
-from astrbot.api.message_components import Plain  # noqa: E402
-from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage  # noqa: E402
-
-from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin  # noqa: E402
-
-_ORIGINAL_ATTR = "_smart_segmentation_original_process"
+from astrbot.api.event import MessageChain, MessageEventResult, ResultContentType
+from astrbot.api.message_components import Plain
+from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
 
 
 class _FakeContext:
@@ -34,6 +26,9 @@ class _FakeEvent:
         self.unified_msg_origin = "test:session"
         self.extra: dict = {}
         self.plugins_name = None
+        self.platform_meta = SimpleNamespace(
+            name="test", id="test", support_streaming_message=True
+        )
 
     def get_result(self):
         return self._result
@@ -61,14 +56,8 @@ def _make_streaming_result():
 @pytest.fixture(autouse=True)
 def _restore_stage_process():
     original = ResultDecorateStage.process
-    saved_attr = getattr(ResultDecorateStage, _ORIGINAL_ATTR, None)
     yield
     ResultDecorateStage.process = original
-    if saved_attr is None:
-        if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):
-            delattr(ResultDecorateStage, _ORIGINAL_ATTR)
-    else:
-        setattr(ResultDecorateStage, _ORIGINAL_ATTR, saved_attr)
 
 
 @pytest.mark.asyncio
@@ -111,7 +100,6 @@ async def test_patch_wraps_real_streaming_result() -> None:
         await plugin.terminate()
 
 
-
 @pytest.mark.asyncio
 async def test_patched_process_delegates_non_streaming_to_original() -> None:
     """补丁必须把非流式结果委托给原 stage，并透传其产出。
@@ -121,11 +109,7 @@ async def test_patched_process_delegates_non_streaming_to_original() -> None:
     内置分段回复、TTS 全部静默失效。
     """
     real_process = ResultDecorateStage.process
-    # 归一化补丁状态：前序测试异常退出时可能在类上留下 _ORIGINAL_ATTR，
-    # 不清掉的话下面的桩替换会被当成"外来修改"而跳过安装。
-    pristine = getattr(ResultDecorateStage, _ORIGINAL_ATTR, real_process)
-    if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):
-        delattr(ResultDecorateStage, _ORIGINAL_ATTR)
+    pristine = real_process
     delegated: list[str] = []
 
     async def stub_process(stage_self, event):
@@ -156,5 +140,3 @@ async def test_patched_process_delegates_non_streaming_to_original() -> None:
         await plugin.terminate()
     finally:
         ResultDecorateStage.process = pristine
-        if hasattr(ResultDecorateStage, _ORIGINAL_ATTR):
-            delattr(ResultDecorateStage, _ORIGINAL_ATTR)

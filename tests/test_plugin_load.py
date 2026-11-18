@@ -1,8 +1,4 @@
-"""Real AstrBot environment smoke tests (skipped when astrbot is absent).
-
-These verify the plugin actually registers hooks into AstrBot's handler
-registry and instantiates against the real Star base.
-"""
+"""Real AstrBot environment smoke tests."""
 
 from __future__ import annotations
 
@@ -11,12 +7,24 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("astrbot")
 
-from astrbot.api.star import Star  # noqa: E402
-from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin  # noqa: E402
+def test_astrbot_version_upper_bound_locked() -> None:
+    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(
+        encoding="utf-8"
+    )
+    constraint = next(
+        line.split(":", 1)[1].strip().strip('"')
+        for line in metadata.splitlines()
+        if line.startswith("astrbot_version:")
+    )
+    assert "<5" in constraint, f"流式兼容只验证到 AstrBot 4.x：{constraint}"
 
-ROOT = Path(__file__).resolve().parents[1]
+
+@pytest.fixture
+def host_plugin():
+    from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
+
+    return SmartSegmentationPlugin
 
 
 def test_hooks_registered_in_astrbot_registry() -> None:
@@ -27,7 +35,6 @@ def test_hooks_registered_in_astrbot_registry() -> None:
     定，写死会让测试随导入方式变化而脆弱。
     """
     from astrbot.core.star.star_handler import EventType, star_handlers_registry
-
     from astrbot_plugin_smart_segmentation import main as main_mod
 
     module_suffix = main_mod.__name__
@@ -45,21 +52,23 @@ def test_hooks_registered_in_astrbot_registry() -> None:
     assert "after_message_sent" in _registered(EventType.OnAfterMessageSentEvent)
 
 
-def test_plugin_is_real_star_and_instantiates() -> None:
+def test_plugin_is_real_star_and_instantiates(host_plugin) -> None:
+    from astrbot.api.star import Star
+
     class FakeContext:
         pass
 
-    plugin = SmartSegmentationPlugin(FakeContext(), {"enabled": True})  # type: ignore[arg-type]
+    plugin = host_plugin(FakeContext(), {"enabled": True})
     assert isinstance(plugin, Star)
     assert callable(plugin.on_decorating_result)
     assert callable(plugin.after_message_sent)
 
 
-def test_terminate_clean() -> None:
+def test_terminate_clean(host_plugin) -> None:
     class FakeContext:
         pass
 
-    plugin = SmartSegmentationPlugin(FakeContext(), {"enabled": True})  # type: ignore[arg-type]
+    plugin = host_plugin(FakeContext(), {"enabled": True})
 
     async def scenario() -> None:
         # 先制造真实的在飞状态，否则下面的清理断言是空 vs 空
@@ -87,14 +96,14 @@ def test_terminate_clean() -> None:
     assert plugin._follow_ups._tasks == set()
 
 
-def test_streaming_patch_idempotent_sync() -> None:
+def test_streaming_patch_idempotent_sync(host_plugin) -> None:
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
     class FakeContext:
         pass
 
     original = ResultDecorateStage.process
-    plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
+    plugin = host_plugin(
         FakeContext(),
         {"enabled": True, "streaming_compat_enabled": True},
     )

@@ -7,3 +7,11 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+
+# 手工部署包（VPS 直投 zip）的导出清单：与主动回复插件同口径，`git archive`
+# 只导出 tracked 文件，这里再排除对部署无意义的仓库内容。目录式条目靠 git
+# 对目录本身的匹配生效，`git check-attr` 查具体文件会显示 unspecified，属正常。
+tests/ export-ignore
+requirements-dev.txt export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore

@@ -128,12 +128,10 @@
     ]
   },
   {
-    "name": "thinking_unclosed",
-    "text": "<think>内部推理未闭合\n\n今天天气不错。",
+    "name": "thinking_unclosed_discarded",
+    "text": "<think>内部推理未闭合\n\n仍在推理。",
     "max_segments": 5,
-    "expected": [
-      "今天天气不错"
-    ]
+    "expected": []
   },
   {
     "name": "emoji_boundary",

@@ -4,24 +4,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
-PKG_NAME = "astrbot_plugin_smart_segmentation"
+# 先初始化宿主插件 API，避免旧版宿主直接导入管线时循环导入。
+import astrbot.api.star  # noqa: F401
 
-# 宿主不在的机器上，直接 import astrbot 的用例会让整个 collection 报错；按模块忽略，
-# 纯领域层的用例（segmentation / settings 契约）仍然能跑。
-_HOST_DEPENDENT_MODULES = [
-    "test_chain_utils.py",
-    "test_follow_up.py",
-    "test_plugin_flow.py",
-    "test_segmenter.py",
-    "test_stream_boundary.py",
-    "test_stream_wrapper.py",
-    "test_streaming_integration.py",
-    "test_streaming_patch.py",
-]
-try:
-    import astrbot  # noqa: F401
-except ModuleNotFoundError:
-    collect_ignore = list(_HOST_DEPENDENT_MODULES)
+PKG_NAME = "astrbot_plugin_smart_segmentation"
 
 _ROOT = Path(__file__).resolve().parents[1]
 

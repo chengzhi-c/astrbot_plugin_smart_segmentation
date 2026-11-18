@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from astrbot.api.event import MessageChain
+from astrbot.api.event import MessageChain, MessageEventResult, ResultContentType
 from astrbot.api.message_components import At, Plain
-
 from astrbot_plugin_smart_segmentation.chain_utils import (
-    _is_plain_chain,
     extract_plain_text_chain,
     is_model_text_result,
+    is_plain_chain,
     replace_plain_text_chain,
     should_segment_text,
 )
@@ -16,9 +15,9 @@ from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 
 
 def test_plain_chain_with_at() -> None:
-    assert _is_plain_chain(MessageChain([At(qq="123"), Plain("x")])) is True
-    assert _is_plain_chain(MessageChain([Plain("x")])) is True
-    assert _is_plain_chain(MessageChain([At(qq="1"), At(qq="2"), Plain("x")])) is True
+    assert is_plain_chain(MessageChain([At(qq="123"), Plain("x")])) is True
+    assert is_plain_chain(MessageChain([Plain("x")])) is True
+    assert is_plain_chain(MessageChain([At(qq="1"), At(qq="2"), Plain("x")])) is True
 
 
 def test_plain_chain_accepts_multiple_plains() -> None:
@@ -34,15 +33,17 @@ def test_plain_chain_accepts_multiple_plains() -> None:
 def test_plain_chain_rejects_displaceable_at() -> None:
     """At 出现在链中间或链尾时不分段：分段会把正文写进第一个 Plain、丢掉其余
     Plain，At 就落到首段末尾且后面没有正文（读 at.name 的端渲染成裸 @）。"""
-    assert _is_plain_chain(MessageChain([Plain("x"), At(qq="123")])) is False
-    assert _is_plain_chain(MessageChain([Plain("前"), At(qq="123"), Plain("后")])) is False
+    assert is_plain_chain(MessageChain([Plain("x"), At(qq="123")])) is False
+    assert (
+        is_plain_chain(MessageChain([Plain("前"), At(qq="123"), Plain("后")])) is False
+    )
     chain = MessageChain([Plain("前"), At(qq="123"), Plain("后")])
     assert replace_plain_text_chain(chain, "新") is False
     assert [type(item) for item in chain.chain] == [Plain, At, Plain]
 
 
 def test_plain_chain_with_foreign_component() -> None:
-    assert _is_plain_chain(MessageChain([Plain("x"), SimpleNamespace()])) is False  # type: ignore[arg-type]
+    assert is_plain_chain(MessageChain([Plain("x"), SimpleNamespace()])) is False  # type: ignore[arg-type]
 
 
 def test_is_model_text_result_rejects_displaceable_at() -> None:
@@ -52,11 +53,11 @@ def test_is_model_text_result_rejects_displaceable_at() -> None:
         [Plain("前"), At(qq="1"), Plain("后")],
         [At(qq="1")],
     ):
-        result = SimpleNamespace(
+        result = MessageEventResult(
             chain=component_chain,
-            is_model_result=lambda: True,
+            result_content_type=ResultContentType.LLM_RESULT,
         )
-        assert is_model_text_result(result) is False  # type: ignore[arg-type]
+        assert is_model_text_result(result) is False
 
 
 def test_extract_strips_thinking() -> None:
@@ -83,49 +84,16 @@ def test_replace_rejects_non_plain_chain() -> None:
 
 
 def test_is_model_text_result() -> None:
-    ok = SimpleNamespace(is_model_result=lambda: True, chain=[Plain("x")])
-    assert is_model_text_result(ok) is True  # type: ignore[arg-type]
-    no = SimpleNamespace(is_model_result=lambda: False, chain=[Plain("x")])
-    assert is_model_text_result(no) is False  # type: ignore[arg-type]
-    no_callable = SimpleNamespace(chain=[Plain("x")])
-    assert is_model_text_result(no_callable) is True  # type: ignore[arg-type]
-
-
-def test_is_model_text_result_falls_back_to_is_llm_result() -> None:
-    """astrbot 4.16–4.19 无 is_model_result：必须回退 is_llm_result，
-    否则任何插件的纯文本结果都会被误当成模型回复拿去分段。"""
-    old_version = SimpleNamespace(
+    model = MessageEventResult(
+        chain=[Plain("模型回复")],
+        result_content_type=ResultContentType.LLM_RESULT,
+    )
+    runner_error = SimpleNamespace(
+        chain=[Plain("agent runner error")],
         is_llm_result=lambda: False,
-        chain=[Plain("x")],
     )
-    assert is_model_text_result(old_version) is False  # type: ignore[arg-type]
-    old_llm = SimpleNamespace(is_llm_result=lambda: True, chain=[Plain("x")])
-    assert is_model_text_result(old_llm) is True  # type: ignore[arg-type]
-
-
-def test_is_model_text_result_prefers_is_model_result() -> None:
-    """4.20+ 两者都有时必须优先 is_model_result（它包含 AGENT_RUNNER_ERROR），
-    顺序反了会把 agent 错误结果误判为非模型结果而静默跳过分段。"""
-    both = SimpleNamespace(
-        is_model_result=lambda: True,
-        is_llm_result=lambda: False,
-        chain=[Plain("x")],
-    )
-    assert is_model_text_result(both) is True  # type: ignore[arg-type]
-    neither_model = SimpleNamespace(
-        is_model_result=lambda: False,
-        is_llm_result=lambda: True,
-        chain=[Plain("x")],
-    )
-    assert is_model_text_result(neither_model) is False  # type: ignore[arg-type]
-
-
-def test_is_model_text_result_rejects_when_checker_raises() -> None:
-    raising = SimpleNamespace(
-        is_model_result=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-        chain=[Plain("x")],
-    )
-    assert is_model_text_result(raising) is False  # type: ignore[arg-type]
+    assert is_model_text_result(model) is True
+    assert is_model_text_result(runner_error) is False
 
 
 def test_should_segment_boundaries() -> None:

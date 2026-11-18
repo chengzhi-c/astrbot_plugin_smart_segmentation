@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import At, Image, Plain, Reply
-
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 from astrbot_plugin_smart_segmentation.streaming.wrapper import (
     STREAMING_SEGMENT_CHAIN_TYPE,
@@ -38,6 +37,232 @@ async def test_stream_splits_and_keeps_component_order() -> None:
         ("plain", "第一句。"),
         ("at", "1"),
         ("plain", "第二句。"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_emit_thinking_content_split_across_chunks() -> None:
+    text = "<think>private。thought?</think>visible。"
+
+    async def gen():
+        for char in text:
+            yield MessageChain([Plain(char)])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    assert _collected(collected) == [("plain", "visible。")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text", ["```html\n<think>visible</think>\n```", "`<think>visible</think>`"]
+)
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_preserves_thinking_tags_inside_markdown_code(
+    text: str, chunk_size: int
+) -> None:
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    visible = "".join(value for kind, value in _collected(collected) if kind == "plain")
+    assert visible == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_hides_nested_thinking_example(chunk_size: int) -> None:
+    text = "<think>reasoning `<think>example</think>` SECRET</think>answer"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    assert (
+        "".join(value for kind, value in _collected(collected) if kind == "plain")
+        == "answer"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "```text\nvisible\n````\n<think>SECRET</think>answer",
+            "```text\nvisible\n````\nanswer",
+        ),
+        (
+            "~~~text\nvisible\n~~~~\n<think>SECRET</think>answer",
+            "~~~text\nvisible\n~~~~\nanswer",
+        ),
+        (
+            "```text\nthis ``` is literal\n<think>VISIBLE</think>\n```\nanswer",
+            "```text\nthis ``` is literal\n<think>VISIBLE</think>\n```\nanswer",
+        ),
+        (
+            "`<think>SECRET</think> xx `` <think>PRIVATE</think>end",
+            "` xx `` end",
+        ),
+        ("`<think\n>SECRET</think>answer", "`<think\n>SECRETanswer"),
+        ("```foo``` <think>SECRET</think>answer", "```foo``` answer"),
+    ],
+    ids=[
+        "long-backtick-close",
+        "long-tilde-close",
+        "code-line-marker",
+        "unmatched-recovery",
+        "multiline-candidate",
+        "line-start-inline",
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_uses_fence_boundaries_for_thinking(
+    text: str, expected: str, chunk_size: int
+) -> None:
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    assert (
+        "".join(value for kind, value in _collected(collected) if kind == "plain")
+        == expected
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_does_not_leak_unclosed_thinking_with_blank_line(
+    chunk_size: int,
+) -> None:
+    text = "<think>SECRET1\n\nanswer<think>SECRET2"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    visible = "".join(value for kind, value in _collected(collected) if kind == "plain")
+    assert visible == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 200])
+@pytest.mark.parametrize("prefix", ["before `\n", "before ` unmatched "])
+async def test_stream_does_not_treat_unmatched_inline_tick_as_thinking_code(
+    chunk_size: int,
+    prefix: str,
+) -> None:
+    text = prefix + "<think>SECRET</think>answer"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    visible = "".join(value for kind, value in _collected(collected) if kind == "plain")
+    assert "answer" in visible
+    assert "SECRET" not in visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "component", [Image.fromURL("https://example.com/image.png"), At(qq="1")]
+)
+async def test_stream_inline_code_does_not_cross_nontext_component(component) -> None:
+    async def gen():
+        yield MessageChain(
+            [Plain("before `"), component, Plain("<think>SECRET</think>`answer")]
+        )
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+        )
+    ]
+    visible = "".join(value for kind, value in _collected(collected) if kind == "plain")
+    assert "answer" in visible
+    assert "SECRET" not in visible
+
+
+@pytest.mark.asyncio
+async def test_stream_resumes_after_closed_thinking_segment() -> None:
+    consumed = 0
+
+    async def gen():
+        nonlocal consumed
+        consumed += 1
+        yield MessageChain([Plain("<think>private</think>visible。")])
+        consumed += 1
+        yield MessageChain([Plain("后续。")])
+
+    stream = stream_realtime_segments(
+        gen(), SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
+    )
+    try:
+        first = await anext(stream)
+        assert _collected([first]) == [("plain", "visible。")]
+        assert consumed == 1
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stream_keeps_mention_for_first_visible_segment() -> None:
+    mention = At(qq="123", name="\u2060")
+
+    async def gen():
+        yield MessageChain([mention, Plain("\u200b \u200b\n今天天气不错。")])
+        yield MessageChain([Plain("\u2060 \u2060\n")])
+        yield MessageChain([Plain("我们出去玩吧。\ufeff")])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(),
+            SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90),
+        )
+    ]
+    assert len(collected) == 2
+    assert collected[0].chain[0] is mention
+    assert _collected(collected) == [
+        ("at", "123"),
+        ("plain", "今天天气不错。"),
+        ("plain", "我们出去玩吧。"),
     ]
 
 
@@ -173,6 +398,7 @@ async def test_stream_flushes_buffer_before_typed_chain() -> None:
 class _FakeEvent:
     def __init__(self) -> None:
         self.extra: dict = {}
+        self.platform_meta = SimpleNamespace(support_streaming_message=True)
 
     def get_extra(self, key: str, default=None):
         return self.extra.get(key, default)
@@ -258,22 +484,86 @@ def _collect_stream(chunks: list[str]) -> tuple[list[str], str]:
     return segments, buffer
 
 
-def test_stream_output_does_not_depend_on_chunking() -> None:
-    """同一条流式回复怎么切块，最终可见内容必须一致（含 markdown 空行）。"""
-    single = _collect_stream(["好啊！\n\n- 列表1\n- 列表2"])
-    multi = _collect_stream(["好啊！", "\n\n- 列表1", "\n- 列表2"])
-    assert single == multi
-    assert "".join([*single[0], single[1]]).startswith("好啊！\n\n- 列表1")
-
-
 def test_stream_keeps_code_block_indentation() -> None:
     """行首缩进是内容：代码块/嵌套列表被剥掉缩进就废了，而且不能随 chunk 漂移。"""
     text = "第一段。\n    print(1)\n    print(2)"
+    results = []
     for chunks in ([text], list(text)):
         segments, rest = _collect_stream(chunks)
+        results.append((segments, rest))
         visible = "".join([*segments, rest])
         assert "    print(1)" in visible
         assert "    print(2)" in visible
+    assert results[0] == results[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, first_segment",
+    [
+        (
+            "详情见 https://example.com/a?b=1&c=2\n后续正文。",
+            "详情见 https://example.com/a?b=1&c=2\n",
+        ),
+        (
+            "```python\nprint('hello?')\nprint('world!')\n```\n后续正文。",
+            "```python\nprint('hello?')\nprint('world!')\n```\n",
+        ),
+        (
+            "| a | b |\n| - | - |\n| 1 | 2 |\n后续正文。",
+            "| a | b |\n| - | - |\n| 1 | 2 |\n",
+        ),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [1, 7, 200])
+async def test_stream_keeps_atoms_across_chunks(
+    text: str, first_segment: str, chunk_size: int
+) -> None:
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(),
+            SegmentationSettings(streaming_min_chars=6, streaming_max_chars=90),
+        )
+    ]
+    assert _collected(collected) == [("plain", first_segment), ("plain", "后续正文。")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://example.com/a?b=1&c=2" + "x" * 160,
+        "```python\n" + "print('x?')\n" * 20,
+    ],
+)
+async def test_stream_oversized_atom_yields_before_source_finishes(text: str) -> None:
+    consumed = 0
+
+    async def gen():
+        nonlocal consumed
+        for char in text:
+            consumed += 1
+            yield MessageChain([Plain(char)])
+
+    stream = stream_realtime_segments(
+        gen(),
+        SegmentationSettings(streaming_min_chars=6, streaming_max_chars=40),
+    )
+    try:
+        first = await anext(stream)
+        assert _collected([first]) == [("plain", text[:40])]
+        assert consumed == 40
+        collected = [first, *[chain async for chain in stream]]
+        parts = [item[1] for item in _collected(collected)]
+        assert all(6 <= len(part) <= 40 for part in parts[:-1])
+        assert "".join(parts) == text
+    finally:
+        await stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -380,9 +670,25 @@ async def test_stream_decorations_follow_next_text() -> None:
     assert all(isinstance(c, Plain) for c in collected[0].chain)
 
 
-def test_decorate_skips_platform_without_streaming_support() -> None:
-    """平台不支持流式消息时，宿主会把每条链重新拼起来再按标点切分，本插件的实时
-    分段到不了用户，只多一层缓冲延迟。"""
+@pytest.mark.parametrize(
+    ("enabled", "guarded", "support_streaming"),
+    [
+        (False, False, True),
+        (True, True, True),
+        (True, False, False),
+    ],
+    ids=["disabled", "guarded", "platform-without-streaming"],
+)
+def test_decorate_skips_when_streaming_not_usable(
+    enabled: bool,
+    guarded: bool,
+    support_streaming: bool,
+) -> None:
+    """关闭、会话被守护、平台不支持流式消息时都不能接管 async_stream。
+
+    平台不支持流式时宿主会把每条链重新拼起来再按标点切分，本插件的实时分段
+    到不了用户，只多一层缓冲延迟。
+    """
 
     async def gen():
         if False:
@@ -391,36 +697,9 @@ def test_decorate_skips_platform_without_streaming_support() -> None:
     result = SimpleNamespace(async_stream=gen())
     original_stream = result.async_stream
     event = _FakeEvent()
-    event.platform_meta = SimpleNamespace(support_streaming_message=False)
-    settings = SegmentationSettings(streaming_compat_enabled=True)
-
-    decorate_streaming_result(event, result, settings, is_guarded=False)  # type: ignore[arg-type]
-    assert result.async_stream is original_stream
-
-
-def test_decorate_skips_when_disabled() -> None:
-    async def gen():
-        if False:
-            yield MessageChain()
-
-    result = SimpleNamespace(async_stream=gen())
-    original_stream = result.async_stream
-    event = _FakeEvent()
-    settings = SegmentationSettings(streaming_compat_enabled=False)
-    decorate_streaming_result(event, result, settings, is_guarded=False)  # type: ignore[arg-type]
-    assert result.async_stream is original_stream
-
-
-def test_decorate_skips_when_guarded() -> None:
-    async def gen():
-        if False:
-            yield MessageChain()
-
-    result = SimpleNamespace(async_stream=gen())
-    original_stream = result.async_stream
-    event = _FakeEvent()
-    settings = SegmentationSettings(streaming_compat_enabled=True)
-    decorate_streaming_result(event, result, settings, is_guarded=True)  # type: ignore[arg-type]
+    event.platform_meta = SimpleNamespace(support_streaming_message=support_streaming)
+    settings = SegmentationSettings(streaming_compat_enabled=enabled)
+    decorate_streaming_result(event, result, settings, is_guarded=guarded)  # type: ignore[arg-type]
     assert result.async_stream is original_stream
 
 
@@ -431,6 +710,7 @@ async def test_stream_passes_through_platform_typed_chains() -> None:
     type 承载业务语义（如 webchat 的音频播放、推理内容展示），拆分会把 base64
     音频切成文本垃圾并丢掉类型。
     """
+
     async def gen():
         yield MessageChain([Plain("。")], type="audio_chunk")
         yield MessageChain([Plain("让我想想。")], type="reasoning")

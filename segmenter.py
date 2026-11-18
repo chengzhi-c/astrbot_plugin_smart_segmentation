@@ -14,6 +14,7 @@ from .errors import brief_exception, is_caller_cancelled
 from .segmentation import (
     SegmentationParseError,
     build_segmentation_prompt,
+    has_visible_text,
     parse_segments_from_model_output,
     same_content,
     split_text_locally,
@@ -40,10 +41,13 @@ class OutboundSegmenter:
             return []
 
         provider_id = await self.resolve_provider_id(event, settings)
+        segments: list[str] | None = None
         if provider_id:
             try:
                 segments = await asyncio.wait_for(
-                    self._segment_with_llm(text, provider_id=provider_id, settings=settings),
+                    self._segment_with_llm(
+                        text, provider_id=provider_id, settings=settings
+                    ),
                     timeout=settings.timeout_seconds,
                 )
             except asyncio.CancelledError as exc:
@@ -53,29 +57,30 @@ class OutboundSegmenter:
                     "智能分段模型调用被取消,本次按标点拆分: %s",
                     brief_exception(exc),
                 )
-                segments = split_text_locally(text, max_segments=settings.max_segments)
             except TimeoutError:
                 logger.warning(
                     "智能分段模型超时(> %.2fs),本次按标点拆分",
                     settings.timeout_seconds,
                 )
-                segments = split_text_locally(text, max_segments=settings.max_segments)
             except SegmentationParseError as exc:
                 logger.warning(
                     "智能分段模型输出无法解析,本次按标点拆分: %s",
                     brief_exception(exc),
                 )
-                segments = split_text_locally(text, max_segments=settings.max_segments)
             except Exception as exc:
                 logger.warning(
                     "智能分段模型调用失败,本次按标点拆分: %s",
                     brief_exception(exc),
                 )
-                segments = split_text_locally(text, max_segments=settings.max_segments)
         else:
-            logger.warning("未找到可用的分段模型,本次按标点拆分。可在插件配置中指定分段模型。")
+            logger.warning(
+                "未找到可用的分段模型,本次按标点拆分。可在插件配置中指定分段模型。"
+            )
+        if segments is None:
             segments = split_text_locally(text, max_segments=settings.max_segments)
 
+        # 内容校验后才过滤纯不可见段，正文里的 ZWJ 等格式字符保持原样。
+        segments = [segment for segment in segments if has_visible_text(segment)]
         if not segments or len(segments) <= 1:
             logger.debug("智能分段跳过：分段结果不足 2 段")
             return []
@@ -89,16 +94,13 @@ class OutboundSegmenter:
         if settings.provider_id:
             return settings.provider_id
 
-        # 缺失该方法时降级为本地规则：AttributeError 不能穿出 hook
-        get_current = getattr(self._context, "get_current_chat_provider_id", None)
-        if not callable(get_current):
-            return ""
+        # 缺失该方法时同样落入 except 降级：AttributeError 不能穿出 hook
         umo = str(getattr(event, "unified_msg_origin", "") or "").strip()
         try:
-            provider_id = await get_current(umo=umo)
+            provider_id = await self._context.get_current_chat_provider_id(umo=umo)
         except Exception as exc:
             # 调用失败：放弃 provider 解析，本次分段走本地规则兜底
-            logger.debug("获取当前会话 provider_id 失败: %s", exc)
+            logger.debug("获取当前会话 provider_id 失败: %s", brief_exception(exc))
             return ""
         return str(provider_id).strip() if provider_id else ""
 
@@ -132,13 +134,10 @@ class OutboundSegmenter:
         provider_id: str,
         prompt: str,
     ) -> Any:
-        generate = getattr(self._context, "llm_generate", None)
-        if not callable(generate):
-            raise RuntimeError("当前 AstrBot Context 不支持 llm_generate")
         # 只传 prompt 与 provider：宿主 4.16-4.29 的 llm_generate 把其余 kwargs
         # 原样交给 provider，而 openai/gemini/anthropic 的 text_chat 全部丢弃，
         # temperature / max_tokens 传过去也不生效。
-        return await generate(
+        return await self._context.llm_generate(
             prompt=prompt,
             chat_provider_id=provider_id,
         )

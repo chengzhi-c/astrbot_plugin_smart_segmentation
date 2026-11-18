@@ -2,20 +2,20 @@
   "enabled": {
     "type": "bool",
     "description": "启用智能分段",
-    "hint": "关闭后回复原样发出,不再分段与补发。",
+    "hint": "关闭后回复原样发出。",
     "default": true
   },
   "provider_id": {
     "type": "string",
     "description": "分段模型",
-    "hint": "留空使用当前会话的聊天模型;也可以指定一个小模型专门用于分段。",
+    "hint": "留空使用当前会话的聊天模型；指定时整条回复会发送给所选模型。",
     "default": "",
     "_special": "select_provider"
   },
   "style": {
     "type": "string",
     "description": "分段风格",
-    "hint": "natural 更像普通聊天;conservative 更少分段;active 更短更活泼。",
+    "hint": "natural 接近普通聊天。conservative 分段更少。active 分段更短、语气更活泼。",
     "default": "active",
     "options": [
       "natural",
@@ -37,7 +37,7 @@
   "max_segments": {
     "type": "int",
     "description": "最大分段数量",
-    "hint": "单次回复最多拆成多少条,避免刷屏。",
+    "hint": "单次回复最多拆成多少条，避免刷屏。内容装不下时会多分几条。",
     "default": 5,
     "slider": {
       "min": 1,
@@ -47,8 +47,8 @@
   },
   "timeout_seconds": {
     "type": "float",
-    "description": "分段模型超时时间(秒)",
-    "hint": "超过该时间停止等待模型,改用本地标点与括号规则分段。",
+    "description": "分段模型超时时间（秒）",
+    "hint": "超过该时间停止等待模型，改用本地标点与括号规则分段。",
     "default": 30.0,
     "slider": {
       "min": 1,
@@ -58,7 +58,7 @@
   },
   "delay_base": {
     "type": "float",
-    "description": "补发基础延迟(秒)",
+    "description": "补发基础延迟（秒）",
     "hint": "每条补发消息的固定等待时间。",
     "default": 0.8,
     "slider": {
@@ -69,8 +69,8 @@
   },
   "delay_per_char": {
     "type": "float",
-    "description": "按字符增加延迟(秒/字符)",
-    "hint": "在该段字符数上追加等待,与基础延迟相加。",
+    "description": "按字符增加延迟（秒/字符）",
+    "hint": "在该段字符数上追加等待，与基础延迟相加。",
     "default": 0.025,
     "slider": {
       "min": 0,
@@ -80,8 +80,8 @@
   },
   "delay_max": {
     "type": "float",
-    "description": "单段最大补发延迟(秒)",
-    "hint": "等待上限:基础延迟 + 字数 × 按字符延迟 + 0~0.15 秒随机抖动,超过本项按本项计。",
+    "description": "单段最大补发延迟（秒）",
+    "hint": "等待上限：基础延迟 + 字数 × 按字符延迟 + 0~0.15 秒随机抖动，超过本项按本项计。",
     "default": 2.5,
     "slider": {
       "min": 0,
@@ -92,13 +92,13 @@
   "streaming_compat_enabled": {
     "type": "bool",
     "description": "启用流式兼容模式",
-    "hint": "开启后,AstrBot 流式输出会按标点、换行和长度实时拆段。逐条发送的平台(如 WebChat)能看到多条消息;飞书、Telegram、QQ 官方机器人、企业微信等平台会把各段累积成一条。",
+    "hint": "开启后，AstrBot 流式输出会按标点、换行和长度实时拆段。平台声明支持流式消息时由插件接管，按切分边界交给平台发送；平台声明不支持时按原有方式发送。",
     "default": false
   },
   "streaming_min_chars": {
     "type": "int",
     "description": "流式最短分段长度",
-    "hint": "短于该长度(按内容字符计,段首空白和换行不计入)时,即使命中标点或换行也继续等待,避免消息过碎。",
+    "hint": "短于该长度（按内容字符计，段首空白和换行不计入）时，即使命中标点或换行也继续等待，避免消息过碎。",
     "default": 18,
     "slider": {
       "min": 1,
@@ -109,7 +109,7 @@
   "streaming_max_chars": {
     "type": "int",
     "description": "流式最长分段长度",
-    "hint": "超过该长度时尽量在逗号、分号、空格或换行处切换;句号等强标点也在该长度处强制切断,避免长时间不出消息。小于「流式最短分段长度」时会被自动抬高。",
+    "hint": "超过该长度时尽量在逗号、分号、空格或换行处切换。句号等强标点也在该长度处强制切断，避免长时间不出消息。小于「流式最短分段长度」时会被自动抬高。",
     "default": 90,
     "slider": {
       "min": 20,

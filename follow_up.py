@@ -17,11 +17,13 @@ from astrbot.api.star import Context
 
 from .bounds import PENDING_FOLLOW_UP_TTL_SECONDS
 from .errors import brief_exception, is_caller_cancelled
-from .segmentation import calculate_send_delay
+from .segmentation import calculate_send_delay, split_oversized_segments
 from .settings import SegmentationSettings
 
 _PENDING_EXTRA_KEY = "smart_segmentation_pending_id"
 _APPLIED_EXTRA_KEY = "smart_segmentation_applied_result"
+_FIRST_SEND_TRACKED_EXTRA_KEY = "smart_segmentation_first_send_tracked"
+_FIRST_SEND_DELIVERED_EXTRA_KEY = "smart_segmentation_first_send_delivered"
 
 
 @dataclass(slots=True)
@@ -32,20 +34,6 @@ class PendingFollowUp:
     delay_per_char: float
     delay_max: float
     expires_at: float
-
-
-def is_platform_send_failure(exc: Exception) -> bool:
-    if exc.__class__.__name__ == "ActionFailed":
-        return True
-    if isinstance(exc, OSError):
-        # TimeoutError / ConnectionError 都是 OSError 子类
-        return True
-    result = getattr(exc, "result", None)
-    if isinstance(result, dict):
-        status = str(result.get("status", "")).lower()
-        retcode = result.get("retcode")
-        return status == "failed" or retcode not in (None, 0, "0")
-    return False
 
 
 class FollowUpDispatcher:
@@ -91,6 +79,24 @@ class FollowUpDispatcher:
         # 循环每步都新建 MessageEventResult）。
         event.set_extra(_APPLIED_EXTRA_KEY, result)
 
+    def track_first_send(self, event: Any) -> None:
+        if event.get_extra(_FIRST_SEND_TRACKED_EXTRA_KEY, False):
+            return
+        original_send = event.send
+        event.set_extra(_FIRST_SEND_TRACKED_EXTRA_KEY, True)
+        event.set_extra(_FIRST_SEND_DELIVERED_EXTRA_KEY, False)
+
+        async def tracked_send(message: Any) -> Any:
+            result = await original_send(message)
+            if result is not False:
+                event.set_extra(_FIRST_SEND_DELIVERED_EXTRA_KEY, True)
+            return result
+
+        event.send = tracked_send
+
+    def first_send_delivered(self, event: Any) -> bool:
+        return bool(event.get_extra(_FIRST_SEND_DELIVERED_EXTRA_KEY, False))
+
     def is_result_applied(self, event: Any, result: Any) -> bool:
         marker = event.get_extra(_APPLIED_EXTRA_KEY, None)
         return marker is not None and marker is result
@@ -101,6 +107,9 @@ class FollowUpDispatcher:
     def clear_extras(self, event: Any) -> None:
         event.set_extra(_PENDING_EXTRA_KEY, "")
         event.set_extra(_APPLIED_EXTRA_KEY, "")
+        event.set_extra(_FIRST_SEND_DELIVERED_EXTRA_KEY, False)
+        # 不清 `_FIRST_SEND_TRACKED_EXTRA_KEY`：event.send 一旦包装就无法撤销，
+        # 清掉标记会让下一轮再包一层，多步 agent 循环里调用链越叠越长。
 
     def register(
         self,
@@ -122,8 +131,7 @@ class FollowUpDispatcher:
         return pending_id
 
     def pop(self, pending_id: str) -> PendingFollowUp | None:
-        # 先取再清理：被显式认领的 pending 即使刚过 TTL 也要交付，否则首段已替换进
-        # 原链、剩余段却在此静默丢失（用户拿到被插件自己截断的回复）。
+        # 先取再清理：被显式认领的 pending 即使刚过 TTL 也要交付。
         pending = self._pending.pop(pending_id, None)
         self.reap_expired()
         return pending
@@ -131,14 +139,18 @@ class FollowUpDispatcher:
     def discard(self, pending_id: str) -> None:
         self._pending.pop(pending_id, None)
 
-    def schedule(self, pending: PendingFollowUp) -> None:
+    def schedule(self, pending: PendingFollowUp, *, start_index: int = 1) -> None:
         if self._stopping:
             return
         # 同会话的补发必须串行：两个 burst 交错发送会把消息顺序打乱。默认 agent
         # runner 用会话锁把整轮运行串行化，第三方 runner（dify/coze/…）没有，
         # 这里自己保证，不依赖 AstrBot 内部的锁。
         self._track(
-            self._run(pending, self._session_tails.get(pending.session)),
+            self._run(
+                pending,
+                self._session_tails.get(pending.session),
+                start_index=start_index,
+            ),
             pending.session,
         )
         # 注意：上一轮结束到本轮被唤醒之间有一个迭代宽的守卫空窗（协程返回即
@@ -147,14 +159,7 @@ class FollowUpDispatcher:
 
     def _track(self, coro: Any, session: str) -> None:
         """登记补发任务并接进同会话串行链。"""
-        try:
-            task = asyncio.create_task(coro)
-        except RuntimeError:
-            # 同步调用路径（没有运行中的事件循环）没有地方执行补发：关掉协程即可，
-            # 不能把 RuntimeError 甩给 register/pop 的调用方。
-            coro.close()
-            logger.debug("智能分段补发任务无法创建：当前没有运行中的事件循环")
-            return
+        task = asyncio.create_task(coro)
         self._session_tails[session] = task
 
         def _forget(finished: asyncio.Task[Any]) -> None:
@@ -168,10 +173,10 @@ class FollowUpDispatcher:
     def reap_expired(self) -> None:
         """兜底交付过期未被认领的 pending。
 
-        after_message_sent 是唯一的交接点：第三方插件只在 DELIVERED 后调它（主动
-        回复插件遇 UNKNOWN 就不调），宿主 RespondStage 判空/去重时也会直接 return。
-        首段是破坏性替换，剩余段只留在 pending 里，静默丢弃等于把回复截断，所以
-        过期后合并补发一次。
+        after_message_sent 是唯一的交接点，但它只代表发送流程结束：发送循环里的异常
+        宿主只记 error 日志，随后照样派发，所以不代表送达成功；第三方插件同样不保证
+        调它（主动回复插件遇 UNKNOWN 就不调），宿主 RespondStage 判空/去重时也会直接
+        return。原结果已替换成首段，pending 保留整轮内容，过期后合并补发。
         """
         if not self._pending:
             return
@@ -186,8 +191,9 @@ class FollowUpDispatcher:
     def flush_stale(self, pending_id: str) -> None:
         """立即交付没人认领的旧 pending（同一事件进入下一轮时用）。
 
-        对应 bug：上一轮结果链已被替换成首段，而宿主/第三方插件没触发
-        after_message_sent，pending 会一直滞留。丢弃等于把回复截断。
+        对应 bug：上一轮结果链已被替换成首段，而 after_message_sent 根本没被调用
+        （它只代表发送流程结束、不代表送达成功，发送失败照样派发；只有当宿主
+        RespondStage 判空/去重提前 return 时才真的不触发），整轮内容会一直滞留。
         """
         pending = self._pending.pop(str(pending_id or "").strip(), None)
         if pending is not None:
@@ -197,9 +203,8 @@ class FollowUpDispatcher:
         if self._stopping:
             return
         logger.warning(
-            "智能分段:上一轮剩余 %s 段未及时发出,已合并补发,会话: %s",
+            "智能分段:上一轮 %s 段未及时发出，已合并补发",
             len(pending.segments),
-            pending.session,
         )
         # 必须排在同会话串行链后面：正常补发正在进行时插进去会把上一轮的 burst
         # 打断（用户看到的消息顺序被打乱）。
@@ -222,7 +227,7 @@ class FollowUpDispatcher:
                 raise
             # 这已经是最后一道兜底，没有可再兜的东西：记一条日志，别让它打断
             # 同会话后面排队的任务。
-            logger.warning("智能分段合并补发被平台取消,会话: %s", pending.session)
+            logger.warning("智能分段合并补发被平台取消")
 
     @classmethod
     async def _wait_previous(cls, previous: asyncio.Task[Any] | None) -> None:
@@ -257,13 +262,17 @@ class FollowUpDispatcher:
         self,
         pending: PendingFollowUp,
         previous: asyncio.Task[Any] | None = None,
+        *,
+        start_index: int = 0,
     ) -> None:
         await self._wait_previous(previous)
-        # 循环开始前就抛异常时（理论路径），合并补发从第一段算起
-        index = 0
+        index = start_index
         try:
             with self._guard_session(pending.session):
-                for index, segment in enumerate(pending.segments):
+                for index, segment in enumerate(
+                    pending.segments[start_index:],
+                    start=start_index,
+                ):
                     if self._stopping or not self._is_enabled():
                         return
                     delay = calculate_send_delay(
@@ -276,54 +285,37 @@ class FollowUpDispatcher:
                         await asyncio.sleep(delay)
                     if self._stopping or not self._is_enabled():
                         return
-                    try:
-                        sent = await self._context.send_message(
-                            pending.session,
-                            MessageChain([Plain(segment)]),
-                        )
-                    except Exception as exc:
-                        if is_platform_send_failure(exc):
-                            logger.warning(
-                                "智能分段补发发送失败，剩余 %s 段将合并补发，会话: %s，错误: %s",
-                                len(pending.segments) - index,
-                                pending.session,
-                                brief_exception(exc),
-                            )
-                            await self._send_merged_remainder(pending, index)
-                            return
-                        raise
+                    sent = await self._context.send_message(
+                        pending.session,
+                        MessageChain([Plain(segment)]),
+                    )
                     if not sent:
                         # False 的语义是「没找到可用的平台」，合并重试同样发不出去，
                         # 只会把真实原因掩盖成「发送失败」。
                         logger.warning(
-                            "智能分段补发失败:该会话没有可用的平台适配器,剩余 %s 段未发送,"
-                            "会话: %s。请确认平台适配器已在运行",
+                            "智能分段补发失败:没有可用的平台适配器，剩余 %s 段未发送。"
+                            "请确认平台适配器已在运行",
                             len(pending.segments) - index,
-                            pending.session,
                         )
                         return
         except asyncio.CancelledError:
             if is_caller_cancelled():
                 logger.debug(
-                    "智能分段后台补发任务被取消（预期路径），会话: %s",
-                    pending.session,
+                    "智能分段后台补发任务被取消（预期路径）",
                 )
                 raise
             # 平台适配器被取消时 CancelledError 会穿过 send_message：剩余段不能
             # 跟着一起丢，走合并兜底（任务本身没有被取消，可以继续 await）。
             logger.warning(
-                "智能分段补发被平台取消，剩余 %s 段将合并补发，会话: %s",
+                "智能分段补发被平台取消，剩余 %s 段将合并补发",
                 len(pending.segments) - index,
-                pending.session,
             )
             await self._send_merged_remainder(pending, index)
         except Exception as exc:
-            # 无论是不是平台类失败，未送出的段都不能丢：首段已被破坏性替换进
-            # 原结果链，剩余段只存在于 pending 里。
+            # 原结果已被替换，未送出的段不能再从消息链恢复。
             logger.error(
-                "智能分段后台补发任务异常，剩余 %s 段将合并补发，会话: %s，错误: %s",
+                "智能分段后台补发任务异常，剩余 %s 段将合并补发，错误: %s",
                 len(pending.segments) - index,
-                pending.session,
                 brief_exception(exc),
             )
             await self._send_merged_remainder(pending, index)
@@ -333,11 +325,7 @@ class FollowUpDispatcher:
         pending: PendingFollowUp,
         index: int,
     ) -> None:
-        """补发中断时把未送出的段合并为一条发出。
-
-        首段已经被替换进原结果链，剩余段只存在于 pending 里：直接丢弃等于用
-        户收到一条被插件自己截断的回复。
-        """
+        """把 start_index 之后尚未送出的段合并后补发。"""
         if self._stopping or not self._is_enabled():
             return
         remainder = "\n".join(
@@ -346,13 +334,20 @@ class FollowUpDispatcher:
         if not remainder:
             return
         try:
-            await self._context.send_message(
-                pending.session,
-                MessageChain([Plain(remainder)]),
-            )
+            for segment in split_oversized_segments([remainder]):
+                sent = await self._context.send_message(
+                    pending.session,
+                    MessageChain([Plain(segment)]),
+                )
+                if sent is False:
+                    logger.warning("智能分段剩余内容合并补发失败:没有可用的平台适配器")
+                    return
+        except asyncio.CancelledError:
+            if is_caller_cancelled():
+                raise
+            logger.warning("智能分段剩余内容合并补发再次被平台取消")
         except Exception as exc:
             logger.error(
-                "智能分段剩余内容合并补发失败，会话: %s，错误: %s",
-                pending.session,
+                "智能分段剩余内容合并补发失败，错误: %s",
                 brief_exception(exc),
             )

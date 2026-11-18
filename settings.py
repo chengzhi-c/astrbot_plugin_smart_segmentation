@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,16 +36,6 @@ class SegmentationSettings:
 
 
 _DEFAULTS = SegmentationSettings()
-
-
-def _get_config_value(config: Any, key: str, default: Any) -> Any:
-    try:
-        if hasattr(config, "get"):
-            return config.get(key, default)
-    except Exception:
-        # 读配置失败必须降级：配置对象抛异常不能打断 hook 或补丁路径
-        pass
-    return default
 
 
 def as_bool(value: Any, default: bool) -> bool:
@@ -81,39 +72,29 @@ def as_float(value: Any, default: float) -> float:
     return default if math.isnan(parsed) else parsed
 
 
-def _clamped(
-    config: Any,
-    key: str,
-    default: Any,
-    lower: Any,
-    upper: Any,
-    cast: Any,
-) -> Any:
-    value = cast(_get_config_value(config, key, default), default)
-    return min(upper, max(lower, value))
-
-
-def _bounded_int(config: Any, key: str, default: int, lower: int, upper: int) -> int:
-    return _clamped(config, key, default, lower, upper, as_int)
+def _bounded_int(
+    config: Mapping[str, Any], key: str, default: int, lower: int, upper: int
+) -> int:
+    return min(upper, max(lower, as_int(config.get(key, default), default)))
 
 
 def _bounded_float(
-    config: Any,
+    config: Mapping[str, Any],
     key: str,
     default: float,
     lower: float,
     upper: float,
 ) -> float:
-    return _clamped(config, key, default, lower, upper, as_float)
+    return min(upper, max(lower, as_float(config.get(key, default), default)))
 
 
-def load_settings(config: Any) -> SegmentationSettings | None:
+def load_settings(config: Mapping[str, Any]) -> SegmentationSettings | None:
     """Return settings when enabled, otherwise None."""
     defaults = _DEFAULTS
-    if not as_bool(_get_config_value(config, "enabled", True), True):
+    if not as_bool(config.get("enabled", True), True):
         return None
 
-    style = str(_get_config_value(config, "style", defaults.style) or defaults.style).strip()
+    style = str(config.get("style", defaults.style) or defaults.style).strip()
     if style not in ALLOWED_STYLES:
         style = defaults.style
 
@@ -136,12 +117,14 @@ def load_settings(config: Any) -> SegmentationSettings | None:
     )
 
     return SegmentationSettings(
-        provider_id=str(
-            _get_config_value(config, "provider_id", defaults.provider_id) or "",
-        ).strip(),
+        provider_id=str(config.get("provider_id", defaults.provider_id) or "").strip(),
         style=style,
-        min_length=_bounded_int(config, "min_length", defaults.min_length, 0, MAX_MIN_LENGTH),
-        max_segments=_bounded_int(config, "max_segments", defaults.max_segments, 1, MAX_SEGMENTS),
+        min_length=_bounded_int(
+            config, "min_length", defaults.min_length, 0, MAX_MIN_LENGTH
+        ),
+        max_segments=_bounded_int(
+            config, "max_segments", defaults.max_segments, 1, MAX_SEGMENTS
+        ),
         timeout_seconds=_bounded_float(
             config,
             "timeout_seconds",
@@ -171,8 +154,7 @@ def load_settings(config: Any) -> SegmentationSettings | None:
             MAX_DELAY_MAX,
         ),
         streaming_compat_enabled=as_bool(
-            _get_config_value(
-                config,
+            config.get(
                 "streaming_compat_enabled",
                 defaults.streaming_compat_enabled,
             ),
@@ -181,4 +163,3 @@ def load_settings(config: Any) -> SegmentationSettings | None:
         streaming_min_chars=streaming_min,
         streaming_max_chars=streaming_max,
     )
-

@@ -1,94 +1,32 @@
-"""Unit tests for the streaming patch recovery state machine.
-
-Real install/restore against the actual ResultDecorateStage is covered by
-test_plugin_load.py and test_streaming_integration.py.
-"""
-
 from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
+from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 from astrbot_plugin_smart_segmentation.streaming.patches import (
-    StreamingPatchManager,
-    _ORIGINAL_ATTR,
     _PATCH_OWNER_ATTR,
+    StreamingPatchManager,
 )
 
 
-def test_prepare_install_restores_foreign_then_installs() -> None:
-    class Stage:
-        pass
+def _settings() -> SegmentationSettings:
+    return SegmentationSettings(streaming_compat_enabled=True)
 
-    async def original_process(stage_self, event):
-        if False:
-            yield None
 
-    def old_patch(stage_self, event):
-        if False:
-            yield None
-
-    setattr(old_patch, _PATCH_OWNER_ATTR, "old-token")
-    Stage.process = old_patch
-    Stage._smart_segmentation_original_process = original_process  # type: ignore[attr-defined]
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
+def _manager(token: str = "mine") -> StreamingPatchManager:
+    return StreamingPatchManager(
+        owner_token=token,
+        get_settings=_settings,
+        is_session_guarded=lambda _session: False,
     )
-    manager._holder = Stage
-    assert manager._prepare_install() is True
-    assert Stage.process is original_process
-    assert manager._original is original_process
 
 
-def test_prepare_install_skips_when_foreign_without_original() -> None:
-    class Stage:
-        pass
-
-    def old_patch(stage_self, event):
-        if False:
-            yield None
-
-    setattr(old_patch, _PATCH_OWNER_ATTR, "old-token")
-    Stage.process = old_patch
-    Stage._smart_segmentation_original_process = None  # type: ignore[attr-defined]
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
-    manager._holder = Stage
-    assert manager._prepare_install() is False
-    assert manager._installed is False
-
-
-def test_sync_retries_after_foreign_patch_is_removed() -> None:
-    """外来补丁占住 process 时先放弃（不刷警告）；它撤走之后必须能重新装上。"""
+def test_foreign_patch_is_left_untouched(caplog) -> None:
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
     original = ResultDecorateStage.process
 
     async def foreign(stage_self, event):
@@ -97,188 +35,262 @@ def test_sync_retries_after_foreign_patch_is_removed() -> None:
 
     setattr(foreign, _PATCH_OWNER_ATTR, "other")
     ResultDecorateStage.process = foreign
+    manager = _manager()
     try:
-        manager.sync(get_settings())
-        assert manager._blocked is True
+        manager.sync(_settings())
+        manager.sync(_settings())
+        assert ResultDecorateStage.process is foreign
         assert manager._installed is False
+        assert caplog.text.count("已由其他插件接管") == 1
 
         ResultDecorateStage.process = original
-        manager.sync(get_settings())
+        manager.sync(_settings())
         assert manager._installed is True
-        assert getattr(ResultDecorateStage.process, _PATCH_OWNER_ATTR, None) == "mine"
+        assert ResultDecorateStage.process is not original
+        manager.sync(None)
+        assert ResultDecorateStage.process is original
     finally:
+        ResultDecorateStage.process = original
+
+
+def test_takeover_then_third_party_restores_our_patch_still_uninstalls_cleanly() -> (
+    None
+):
+    """第三方接管后又把我们这份 patched 挂回来时，disable 仍必须还原到宿主原函数。
+
+    接管分支若清空 `_original`，`_install` 再次命中自己的 owner 时只剩
+    `_installed=True`，`_restore` 就没有可还原的目标，宿主的 process 会永久挂着
+    本插件的闭包（插件实例泄漏）。
+    """
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+
+    original = ResultDecorateStage.process
+
+    async def foreign(stage_self, event):
+        if False:
+            yield None
+
+    setattr(foreign, _PATCH_OWNER_ATTR, "other")
+    manager = _manager()
+    try:
+        manager.sync(_settings())
+        ours = ResultDecorateStage.process
+        assert ours is not original
+
+        # 第三方接管：保存我们的 patched 再替换。sync 走进接管分支，
+        # 旧实现会在这里把 _original 清成 None。
+        ResultDecorateStage.process = foreign
+        manager.sync(_settings())
+        assert manager._installed is False
+
+        # 第三方卸载，把保存的那份 patched 原样还原回来。没有中间 sync：
+        # 紧接着 disable/terminate 就必须还原到最初的宿主原函数。
+        ResultDecorateStage.process = ours
         manager.sync(None)
         assert ResultDecorateStage.process is original
 
-
-def test_install_exception_blocks_further_retries() -> None:
-    """宿主内部路径变更会让 import 持续失败：记一次就够，不能每 30 秒重试刷 warning。"""
-    import sys
-
-    from astrbot.core.pipeline.result_decorate import stage as stage_module
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
-    key = stage_module.__name__
-    saved = sys.modules[key]
-    sys.modules[key] = None  # type: ignore[assignment]
-    try:
-        manager.sync(get_settings())
+        # 另一条路径：`_install` 命中 owner == 自己但 `_original` 为空（如本实例
+        # disable 后 patched 又被挂回）时，必须从 patched 自身记录的宿主原函数恢复。
+        recreated = _manager()
+        ResultDecorateStage.process = ours
+        recreated.sync(_settings())
+        assert recreated._installed is True
+        recreated.sync(None)
+        assert ResultDecorateStage.process is original
     finally:
-        sys.modules[key] = saved
-    assert manager._blocked is True
-    assert manager._installed is False
-
-    # import 恢复之后也不该立刻重试：等期望状态变化
-    manager.sync(get_settings())
-    assert manager._installed is False
+        ResultDecorateStage.process = original
 
 
-def test_restore_clears_original_attr_and_allows_reinstall() -> None:
-    """恢复后必须清掉 _ORIGINAL_ATTR：留着它，之后任何替换 process 的代码都会
-    被当成"外来修改"，后续合法安装全部被静默跳过。"""
-    class Stage:
-        pass
+def test_disabled_under_foreign_takeover_leaves_the_slot_to_the_third_party() -> None:
+    """第三方占槽期间本实例被禁用，不得把对方的补丁改回自己的。
 
-    async def original_process(stage_self, event):
-        if False:
-            yield None
-
-    Stage.process = original_process
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
-    manager._holder = Stage
-    assert manager._prepare_install() is True
-    manager._apply_patch()
-    assert manager._installed is True
-    assert Stage.process is not original_process
-
-    manager.sync(None)
-    assert Stage.process is original_process
-    assert not hasattr(Stage, _ORIGINAL_ATTR)
-
-    # 第三方随后替换了 process：再开启流式兼容必须能正常装回去
-    # （直接走 _prepare_install/_apply_patch：sync→_install 会自行解析真实 holder）
-    async def foreign_process(stage_self, event):
-        if False:
-            yield None
-
-    Stage.process = foreign_process
-    assert manager._prepare_install() is True
-    manager._apply_patch()
-    assert manager._installed is True
-    assert getattr(Stage.process, _PATCH_OWNER_ATTR, None) == "mine"
-    assert manager._original is foreign_process
-
-    manager.sync(None)
-    assert Stage.process is foreign_process
-    assert not hasattr(Stage, _ORIGINAL_ATTR)
-
-
-def test_sync_reinstalls_when_ownership_lost() -> None:
-    """补丁被别的实例接管/还原后，sync 必须重新装上而不是永远早退。
-
-    否则 `_installed` 仍为 True，周期同步永远早退，流式兼容静默失效。
+    旧实例把宿主原函数记在类属性上，第三方接管后该记录还在：若 disable 直接按
+    `_original` 还原，就会把第三方正在用的补丁踢掉。这里钉住「禁用只清自己的
+    状态，槽位归当时的所有者」。
     """
-
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-
-        return SegmentationSettings(streaming_compat_enabled=True)
-
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
-    def owner_of() -> object:
-        return getattr(ResultDecorateStage.process, _PATCH_OWNER_ATTR, None)
-
-    mine = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
-    other = StreamingPatchManager(
-        owner_token="other",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
-    )
     original = ResultDecorateStage.process
+
+    async def foreign(stage_self, event):
+        if False:
+            yield None
+
+    setattr(foreign, _PATCH_OWNER_ATTR, "other")
+    manager = _manager()
     try:
-        mine.sync(get_settings())
-        assert owner_of() == "mine"
-        # 另一个实例接管（热重载后两个实例并存时就是这个形状）
-        other.sync(get_settings())
-        assert owner_of() == "other"
-        # mine 的 _installed 仍是 True：不纠正就永远早退，流式兼容静默失效
-        mine.sync(get_settings())
-        assert owner_of() == "mine"
+        manager.sync(_settings())
+        ResultDecorateStage.process = foreign
+        manager.sync(_settings())
+        manager.sync(None)
+        assert ResultDecorateStage.process is foreign
     finally:
-        mine.sync(None)
-        other.sync(None)
+        ResultDecorateStage.process = original
+
+
+def test_next_instance_recovers_from_a_stale_patch_left_on_the_host() -> None:
+    """旧实例未卸载就消失时，新实例要能识别并接管残留补丁。
+
+    宿主热重载会直接构造新实例，旧实例的 terminate 不保证被调用；类属性里记着
+    真宿主原函数，新实例据此先还原再装自己，否则 process 会永远停在旧闭包上。
+    """
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+
+    original = ResultDecorateStage.process
+    stale = _manager("stale")
+    fresh = _manager("fresh")
+    try:
+        stale.sync(_settings())
+        assert ResultDecorateStage.process is not original
+        # 旧实例不 terminate，直接构造新实例并同步。
+        fresh.sync(_settings())
+        assert fresh._installed is True
+        fresh.sync(None)
         assert ResultDecorateStage.process is original
+        # 旧实例随后再同步两轮都不得把已退休的补丁装回去。
+        stale.sync(_settings())
+        stale.sync(_settings())
+        assert ResultDecorateStage.process is original
+    finally:
+        ResultDecorateStage.process = original
+
+
+def test_stale_install_record_does_not_touch_another_plugins_patch() -> None:
+    """本插件装过一次后第三方再接管，类上的安装记录不得让我们的新实例越权。
+
+    判定残留只看对方函数带不带本插件标记：没有标记的补丁属于别人，即便类上还
+    留着我们上次安装的宿主原函数。
+    """
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+
+    original = ResultDecorateStage.process
+
+    async def foreign(stage_self, event):
+        if False:
+            yield None
+
+    setattr(foreign, _PATCH_OWNER_ATTR, "other")
+    first = _manager("first")
+    second = _manager("second")
+    try:
+        first.sync(_settings())
+        ResultDecorateStage.process = foreign
+        second.sync(_settings())
+        assert ResultDecorateStage.process is foreign, (
+            "第三方补丁被本插件的残留记录顶掉"
+        )
+        assert second._installed is False
+    finally:
+        ResultDecorateStage.process = original
+
+
+@pytest.mark.asyncio
+async def test_dead_patch_restored_by_third_party_detaches_on_first_call() -> None:
+    """已禁用实例的闭包被第三方卸载时挂回，调用一次就应还原为宿主原函数。
+
+    宿主热重载不保证调用 terminate，闭包可能长期留在类上；靠调用时自愈把槽位
+    还给宿主，避免已卸载的插件继续占用管线。
+    """
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+
+    original = ResultDecorateStage.process
+
+    async def fake_process(stage_self, event):
+        yield "sentinel"
+
+    manager = _manager("dead")
+    try:
+        ResultDecorateStage.process = fake_process
+        manager.sync(_settings())
+        dead = ResultDecorateStage.process
+        manager.sync(None)
+        assert ResultDecorateStage.process is fake_process
+        ResultDecorateStage.process = dead  # 第三方把这份闭包挂回来
+        event = SimpleNamespace(
+            get_result=lambda: SimpleNamespace(),
+            unified_msg_origin="fake:group:1",
+        )
+        assert [item async for item in dead(object(), event)] == ["sentinel"]
+        assert ResultDecorateStage.process is fake_process
+    finally:
+        ResultDecorateStage.process = original
 
 
 def test_decoration_failure_does_not_block_the_message(monkeypatch) -> None:
-    """装饰失败不能让整条消息发不出去：补丁不在 handler 注册表里，异常会穿过
-    整个管线，让 RespondStage 根本不执行。"""
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
     from astrbot_plugin_smart_segmentation.streaming import patches as patches_mod
 
-    class Stage:
-        pass
+    original = ResultDecorateStage.process
 
     async def original_process(stage_self, event):
         yield "sentinel"
 
-    Stage.process = original_process
+    ResultDecorateStage.process = original_process
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("decorate exploded")
+    def fail(*args, **kwargs):
+        raise RuntimeError("boom")
 
-    # 强制走进流式分支，并让装饰本身爆炸
     monkeypatch.setattr(patches_mod, "is_streaming_result", lambda _result: True)
-    monkeypatch.setattr(patches_mod, "decorate_streaming_result", boom)
+    monkeypatch.setattr(patches_mod, "decorate_streaming_result", fail)
+    manager = _manager()
+    try:
+        manager.sync(_settings())
 
-    def get_settings():
-        from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
+        class Event:
+            unified_msg_origin = "sess:1"
 
-        return SegmentationSettings(streaming_compat_enabled=True)
+            def get_result(self):
+                return SimpleNamespace(result_content_type="streaming_result")
 
-    manager = StreamingPatchManager(
-        owner_token="mine",
-        get_settings=get_settings,
-        is_session_guarded=lambda _s: False,
+        async def scenario():
+            return [
+                item
+                async for item in ResultDecorateStage.process(
+                    ResultDecorateStage(),
+                    Event(),
+                )
+            ]
+
+        assert asyncio.run(scenario()) == ["sentinel"]
+    finally:
+        manager.sync(None)
+        ResultDecorateStage.process = original
+
+
+def test_stopping_patch_delegates_without_decorating(monkeypatch) -> None:
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+    from astrbot_plugin_smart_segmentation.streaming import patches as patches_mod
+
+    original = ResultDecorateStage.process
+    calls: list[object] = []
+
+    async def original_process(stage_self, event):
+        yield "sentinel"
+
+    ResultDecorateStage.process = original_process
+    monkeypatch.setattr(patches_mod, "is_streaming_result", lambda _result: True)
+    monkeypatch.setattr(
+        patches_mod,
+        "decorate_streaming_result",
+        lambda *args: calls.append(args),
     )
-    manager._holder = Stage
-    assert manager._prepare_install() is True
-    manager._apply_patch()
-    assert manager._installed is True
+    manager = _manager()
+    try:
+        manager.sync(_settings())
+        patched = ResultDecorateStage.process
+        manager.mark_stopping()
 
-    class Event:
-        unified_msg_origin = "sess:1"
+        class Event:
+            unified_msg_origin = "sess:1"
 
-        def get_result(self):
-            return SimpleNamespace(result_content_type="streaming_result")
+            def get_result(self):
+                return SimpleNamespace(result_content_type="streaming_result")
 
-    async def scenario():
-        return [item async for item in Stage.process(Stage(), Event())]
+        async def scenario():
+            return [item async for item in patched(ResultDecorateStage(), Event())]
 
-    assert asyncio.run(scenario()) == ["sentinel"]  # 原 stage 产出照常透传
-
-    manager.sync(None)
-    assert Stage.process is original_process
+        assert asyncio.run(scenario()) == ["sentinel"]
+        assert calls == []
+    finally:
+        manager.sync(None)
+        ResultDecorateStage.process = original

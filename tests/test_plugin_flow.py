@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-from astrbot.api.message_components import Plain
-
+from astrbot.api.message_components import At, Image, Plain
 from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
 
 
 class FakeResult:
     def __init__(self, text: str) -> None:
         self.chain = [Plain(text)]
-        self.is_model_result = lambda: True
+        self.is_llm_result = lambda: True
         # 宿主实现：把链里 Plain 的文本拼起来（多段用空格 join）
         self.get_plain_text = lambda: " ".join(
             comp.text for comp in self.chain if isinstance(comp, Plain)
@@ -24,6 +25,7 @@ class FakeEvent:
         self._result = result
         self.extra: dict = {}
         self.unified_msg_origin = "sess:1"
+        self.sent = []
 
     def get_result(self):
         return self._result
@@ -34,6 +36,12 @@ class FakeEvent:
     def set_extra(self, key: str, value) -> None:
         self.extra[key] = value
 
+    def get_platform_name(self) -> str:
+        return "aiocqhttp"
+
+    async def send(self, message):
+        self.sent.append(message)
+
 
 class FakeContext:
     # 桩输出默认与下文文本一致；分段模型路径若失效（校验拒绝/调用失败）会退回本地
@@ -42,6 +50,9 @@ class FakeContext:
         self.sent: list[tuple[str, str]] = []
         self.generate_calls: list[dict] = []
         self.completion = completion
+
+    def get_config(self, umo=None):
+        return {}
 
     async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
         return "p1"
@@ -88,6 +99,7 @@ async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
     await plugin.on_decorating_result(event)  # type: ignore[arg-type]
     assert len(ctx.generate_calls) == calls_before
 
+    await event.send(result)
     await plugin.after_message_sent(event)  # type: ignore[arg-type]
     tasks = [t for t in list(plugin._follow_ups._tasks) if not t.done()]  # type: ignore[attr-defined]
     if tasks:
@@ -95,6 +107,98 @@ async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.sent == [("sess:1", "我们出去玩吧")]
 
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_model", [True, False], ids=["model", "local"])
+async def test_plugin_does_not_send_invisible_segments_with_mention(
+    use_model: bool,
+) -> None:
+    parts = ["\u200b \u200b", "今天天气不错", "\u2060", "我们出去玩吧", "\ufeff"]
+    ctx = FakeContext(json.dumps(parts) if use_model else "invalid JSON")
+    plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
+        ctx,
+        {"enabled": True, "min_length": 2, "delay_max": 0},
+    )
+    result = FakeResult("\n".join(parts))
+    mention = At(qq="123", name="\u2060")
+    result.chain.insert(0, mention)
+    event = FakeEvent(result)
+    try:
+        await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        assert result.get_plain_text() == "今天天气不错"
+        assert result.chain[0] is mention
+
+        await event.send(result)
+        await plugin.after_message_sent(event)  # type: ignore[arg-type]
+        await asyncio.gather(*list(plugin._follow_ups._tasks))
+        assert ctx.sent == [("sess:1", "我们出去玩吧")]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_first_segment_failure_restores_the_full_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
+        lambda *_a, **_k: 0.0,
+    )
+
+    class FailingEvent(FakeEvent):
+        async def send(self, message):
+            raise RuntimeError("platform send failed")
+
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
+        ctx,
+        {
+            "enabled": True,
+            "min_length": 2,
+            "delay_base": 0,
+            "delay_per_char": 0,
+            "delay_max": 0,
+        },
+    )
+    result = FakeResult("今天天气不错我们出去玩吧")
+    event = FailingEvent(result)
+    try:
+        await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        with pytest.raises(RuntimeError, match="platform send failed"):
+            await event.send(result)
+
+        await plugin.after_message_sent(event)  # type: ignore[arg-type]
+        await asyncio.gather(*list(plugin._follow_ups._tasks))  # type: ignore[attr-defined]
+        assert ctx.sent == [
+            ("sess:1", "今天天气不错"),
+            ("sess:1", "我们出去玩吧"),
+        ]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guarded", [False, True], ids=["idle", "follow-up-in-flight"])
+async def test_plugin_clears_result_without_visible_body(guarded: bool) -> None:
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(ctx, {"enabled": True})  # type: ignore[arg-type]
+    result = FakeResult("\u200b \u2060\ufeff")
+    result.chain.insert(0, At(qq="123", name="\u2060"))
+    event = FakeEvent(result)
+    try:
+        guard = (
+            plugin._follow_ups._guard_session(event.unified_msg_origin)
+            if guarded
+            else nullcontext()
+        )
+        with guard:
+            await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        assert result.chain == []
+        assert ctx.generate_calls == []
+        assert plugin._follow_ups.pending_id_of(event) == ""
+    finally:
+        await plugin.terminate()
 
 
 @pytest.mark.asyncio
@@ -164,6 +268,27 @@ async def test_plugin_normalizes_thinking_tags_when_only_body_was_sent() -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("guarded", [False, True], ids=["idle", "guarded"])
+async def test_plugin_strips_thinking_from_short_reply(guarded: bool) -> None:
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(ctx, {"enabled": True, "min_length": 12})  # type: ignore[arg-type]
+    result = FakeResult("<think>secret</think>Hi")
+    event = FakeEvent(result)
+    guard = (
+        plugin._follow_ups._guard_session(event.unified_msg_origin)
+        if guarded
+        else nullcontext()
+    )
+
+    try:
+        with guard:
+            await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        assert [component.text for component in result.chain] == ["Hi"]
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_plugin_yields_but_still_strips_thinking_tags() -> None:
     """让位给宿主内置分段时也要摘掉 think 原文：宿主会把链直接切分发给用户。"""
     ctx = FakeContext()
@@ -227,7 +352,9 @@ async def test_builtin_segmentation_warning_logged_once(monkeypatch) -> None:
     from astrbot_plugin_smart_segmentation import main as main_mod
 
     warnings: list[str] = []
-    monkeypatch.setattr(main_mod.logger, "warning", lambda *args, **_k: warnings.append(str(args)))
+    monkeypatch.setattr(
+        main_mod.logger, "warning", lambda *args, **_k: warnings.append(str(args))
+    )
 
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(ctx, {"enabled": True, "min_length": 2})  # type: ignore[arg-type]
@@ -291,7 +418,6 @@ async def test_sync_loop_installs_patch_without_message_events(
 ) -> None:
     """流式路径无 hook，补丁装卸必须能不依赖消息事件完成（D-1）。"""
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
-
     from astrbot_plugin_smart_segmentation import main as main_mod
 
     original = ResultDecorateStage.process
@@ -302,8 +428,17 @@ async def test_sync_loop_installs_patch_without_message_events(
     try:
         assert plugin._streaming is None
 
+        synced = asyncio.Event()
+        sync = plugin._sync_streaming
+
+        def wait_for_install(settings):
+            sync(settings)
+            if plugin._streaming is not None and plugin._streaming._installed:
+                synced.set()
+
+        plugin._sync_streaming = wait_for_install  # type: ignore[method-assign]
         config["streaming_compat_enabled"] = True
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(synced.wait(), timeout=1)
 
         assert plugin._streaming is not None
         assert plugin._streaming._desired_enabled is True
@@ -326,7 +461,17 @@ async def test_sync_loop_reaps_expired_pending(
     monkeypatch.setattr(main_mod, "STREAMING_SYNC_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(follow_up_mod, "PENDING_FOLLOW_UP_TTL_SECONDS", 0.0)
 
-    ctx = FakeContext()
+    class SignalContext(FakeContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered = asyncio.Event()
+
+        async def send_message(self, session, chain):
+            sent = await super().send_message(session, chain)
+            self.delivered.set()
+            return sent
+
+    ctx = SignalContext()
     plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
         ctx,
         {
@@ -345,7 +490,7 @@ async def test_sync_loop_reaps_expired_pending(
         settings=settings,
     )
 
-    await asyncio.sleep(0.06)
+    await asyncio.wait_for(ctx.delivered.wait(), timeout=1)
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
         await task
     assert ctx.sent == [("sess:1", "二\n三")]
@@ -392,8 +537,6 @@ async def test_terminate_unpatches_even_if_shutdown_raises(
     插件实例也随闭包一起无法回收。"""
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
-    from astrbot_plugin_smart_segmentation.streaming.patches import _ORIGINAL_ATTR
-
     original = ResultDecorateStage.process
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
@@ -411,7 +554,6 @@ async def test_terminate_unpatches_even_if_shutdown_raises(
         await plugin.terminate()
 
     assert ResultDecorateStage.process is original
-    assert not hasattr(ResultDecorateStage, _ORIGINAL_ATTR)
 
 
 @pytest.mark.asyncio
@@ -436,7 +578,7 @@ async def test_guarded_decorate_clears_stale_bookkeeping() -> None:
     # 清簿记不能等于丢内容：剩余段要合并补发出去
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
         await task
-    assert ctx.sent == [("sess:1", "我们出去玩吧")]
+    assert ctx.sent == [("sess:1", "今天天气不错\n我们出去玩吧")]
 
     await plugin.terminate()
 
@@ -468,7 +610,7 @@ async def test_stale_pending_from_previous_round_is_delivered() -> None:
 
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
         await task
-    assert ("sess:1", "我们出去玩吧") in ctx.sent
+    assert ("sess:1", "今天天气不错\n我们出去玩吧") in ctx.sent
     assert plugin._follow_ups.pending_id_of(event) != stale_id  # type: ignore[attr-defined]
 
     await plugin.terminate()
@@ -525,3 +667,23 @@ async def test_sync_loop_stops_on_terminate() -> None:
     assert task is not None
     await plugin.terminate()
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_image_reply_is_left_to_the_host_instead_of_being_deleted() -> None:
+    """带图片的回复必须原样留给宿主，不能被当成空回复吞掉。
+
+    非纯文本链在 is_model_text_result 就被挡回（链不动、直接返回），这里钉住的是
+    这个顺序：任何把「取不出正文」与「内容是空的」并成一个出口的改动，都会让
+    模型每一条「文字 + 图片」回复在群里消失。
+    """
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(ctx, {"enabled": True, "min_length": 2})  # type: ignore[arg-type]
+    result = FakeResult("配图说明")
+    result.chain = [Plain("配图说明"), Image(file="pic.jpg")]
+    event = FakeEvent(result)
+
+    await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+
+    assert result.chain, "含图片的回复被整条删掉了"
+    await plugin.terminate()

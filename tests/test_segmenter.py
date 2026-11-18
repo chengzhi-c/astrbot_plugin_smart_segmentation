@@ -4,21 +4,23 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-
 from astrbot_plugin_smart_segmentation.segmenter import OutboundSegmenter
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
-from astrbot_plugin_smart_segmentation.errors import brief_exception
 
 
 class FakeContext:
-    def __init__(self, *, provider_id: str = "p1", completion: str = '["你好", "世界"]') -> None:
+    def __init__(
+        self, *, provider_id: str = "p1", completion: str = '["你好", "世界"]'
+    ) -> None:
         self._provider_id = provider_id
         self._completion = completion
         self.generate_calls: list[dict] = []
+        self.provider_lookups = 0
         self.delay = 0.0
         self.raise_cancelled = False
 
     async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        self.provider_lookups += 1
         return self._provider_id
 
     async def llm_generate(self, **kwargs):
@@ -40,6 +42,18 @@ async def test_segment_llm_success() -> None:
     assert segs == ["你好", "世界"]
     # 只传 prompt 与 provider：temperature/max_tokens 传过去也会被 provider 丢弃
     assert set(ctx.generate_calls[0]) == {"prompt", "chat_provider_id"}
+
+
+@pytest.mark.asyncio
+async def test_segment_preserves_format_characters_inside_visible_text() -> None:
+    ctx = FakeContext(completion='["你\u200b好", "👩\u200d💻"]')
+    segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
+    segments = await segmenter.segment(
+        SimpleNamespace(unified_msg_origin="sess:1"),  # type: ignore[arg-type]
+        "你\u200b好👩\u200d💻",
+        SegmentationSettings(min_length=2),
+    )
+    assert segments == ["你\u200b好", "👩\u200d💻"]
 
 
 @pytest.mark.asyncio
@@ -86,7 +100,7 @@ async def test_segment_skip_short() -> None:
 
 
 @pytest.mark.asyncio
-async def test_segment_timeout_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_segment_timeout_falls_back() -> None:
     ctx = FakeContext(completion='["x","y"]')
     ctx.delay = 0.05
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
@@ -111,17 +125,20 @@ class RaisingGenerateContext:
         return "p1"
 
     async def llm_generate(self, **kwargs):
-        raise RuntimeError("provider exploded")
+        raise RuntimeError("https://user:secret@example.com/api?token=abcdef")
 
 
 @pytest.mark.asyncio
-async def test_segment_llm_exception_falls_back() -> None:
+async def test_segment_llm_exception_falls_back(caplog) -> None:
     """LLM 调用抛异常必须走本地兜底：冒泡出 hook 会让每条消息都炸。"""
     segmenter = OutboundSegmenter(RaisingGenerateContext())  # type: ignore[arg-type]
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
     segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
     assert segs == ["第一句", "第二句"]
+    assert "RuntimeError" in caplog.text
+    assert "secret" not in caplog.text
+    assert "abcdef" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -146,27 +163,7 @@ async def test_segment_prefers_configured_provider_id() -> None:
     )
     await segmenter.segment(event, "你好。世界。继续说一点", settings)  # type: ignore[arg-type]
     assert ctx.generate_calls[0].get("chat_provider_id") == "configured"
-
-
-def test_brief_exception_truncates() -> None:
-    exc = RuntimeError("x" * 500)
-    text = brief_exception(exc)
-    assert text.startswith("RuntimeError:")
-    assert len(text) < 220
-
-
-def test_brief_exception_formats_dict_result() -> None:
-    """平台异常的 exc.result dict 走 wording 字段并被截断。"""
-    exc = RuntimeError("boom")
-    exc.result = {  # type: ignore[attr-defined]
-        "retcode": 1200,
-        "wording": "发送失败" + "y" * 500,
-    }
-    text = brief_exception(exc)
-    assert text.startswith("RuntimeError(retcode=1200")
-    assert "发送失败" in text
-    assert len(text) < 220
-
+    assert ctx.provider_lookups == 0
 
 
 @pytest.mark.asyncio
@@ -181,19 +178,25 @@ async def test_segment_cancelled_when_stopping_raises() -> None:
         await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
 
 
+class SyncProviderContext(FakeContext):
+    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        return self._provider_id
+
+
 @pytest.mark.asyncio
-async def test_segment_llm_receives_provider_id() -> None:
-    ctx = FakeContext(provider_id="p9")
+async def test_sync_provider_id_degrades_to_local_fallback() -> None:
+    """4.16-4.29 的 get_current_chat_provider_id 都是 async def。
+
+    同步返回模型 ID 的实现不合法：await 抛 TypeError 后按约定记 debug、返回空串，
+    本次走本地规则，不能把异常带出 hook。
+    """
+    ctx = SyncProviderContext()
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
-    await segmenter.segment(event, "你好。世界。继续说一点", settings)  # type: ignore[arg-type]
-    assert ctx.generate_calls[0].get("chat_provider_id") == "p9"
-
-
-class TypeErrorProviderContext(FakeContext):
-    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
-        raise TypeError("signature mismatch")
+    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
+    assert segs == ["第一句", "第二句"]
+    assert ctx.generate_calls == []
 
 
 @pytest.mark.asyncio
@@ -206,23 +209,3 @@ async def test_provider_cancelled_error_falls_back_to_local() -> None:
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
     segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
     assert segs == ["第一句", "第二句"]
-
-
-@pytest.mark.asyncio
-async def test_provider_id_typeerror_fallback() -> None:
-    ctx = TypeErrorProviderContext()
-    segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
-    event = SimpleNamespace(unified_msg_origin="sess:1")
-    settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
-    segs = await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
-    assert segs == ["第一句", "第二句"]
-
-
-def test_brief_exception_never_raises() -> None:
-    """摘要函数在 except 块里调用：它自己抛异常会让上抛路径变成二次异常。"""
-
-    class Bad(Exception):
-        def __str__(self) -> str:
-            raise RuntimeError("str() exploded")
-
-    assert brief_exception(Bad()) == "Bad"
