@@ -52,6 +52,7 @@ class StreamingPatchManager:
         self._installed = False
         self._blocked_on: Any = None
         self._retired = False
+        self._restore_failure_logged = False
 
     def mark_stopping(self) -> None:
         self._stopping = True
@@ -242,17 +243,34 @@ class StreamingPatchManager:
 
     def _restore(self) -> None:
         holder = self._holder
+        if holder is None:
+            self._installed = False
+            self._original = None
+            self._restore_failure_logged = False
+            return
         try:
-            if holder is not None and self._owns_current_patch():
+            if self._owns_current_patch():
                 target = self._recoverable_original()
                 if target is not None:
                     setattr(holder, _TARGET_ATTR, target)
                     if getattr(holder, _HOST_ORIGINAL_ATTR, None) is target:
                         delattr(holder, _HOST_ORIGINAL_ATTR)
+                self._installed = False
+                self._original = None
+                self._restore_failure_logged = False
             elif self._installed:
                 logger.debug("未恢复流式补丁:当前方法不属于本实例")
+                self._installed = False
+                self._original = None
+                self._restore_failure_logged = False
         except Exception as exc:
-            logger.debug("恢复流式兼容补丁失败: %s", brief_exception(exc))
-        finally:
-            self._installed = False
-            self._original = None
+            # 槽位仍挂着本插件的闭包：保留 _installed/_original，下次 sync 继续重试。
+            # 每条消息都会 sync，持续失败只在第一次告警，后续压到 debug。
+            if self._restore_failure_logged:
+                logger.debug("恢复流式兼容补丁仍失败: %s", brief_exception(exc))
+            else:
+                self._restore_failure_logged = True
+                logger.warning(
+                    "恢复流式兼容补丁失败,将在下次同步重试: %s",
+                    brief_exception(exc),
+                )

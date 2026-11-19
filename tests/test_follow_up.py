@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
+from astrbot.api.star import Context
 from astrbot_plugin_smart_segmentation.follow_up import FollowUpDispatcher
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 
@@ -13,12 +15,8 @@ FAST_SETTINGS = SegmentationSettings(delay_base=0, delay_per_char=0, delay_max=0
 class FakeContext:
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
-        self.fail_once = False
 
     async def send_message(self, session, chain):
-        if self.fail_once:
-            self.fail_once = False
-            raise RuntimeError("fail")
         text = "".join(getattr(c, "text", "") for c in chain.chain)
         self.sent.append((session, text))
         return True
@@ -42,21 +40,42 @@ async def test_follow_up_sends_all_segments() -> None:
 
 
 @pytest.mark.asyncio
-async def test_follow_up_stops_on_platform_failure() -> None:
-    ctx = FakeContext()
-    ctx.fail_once = True
+async def test_follow_up_does_not_repeat_unknown_segment() -> None:
+    class SubmittedThenFailedContext(FakeContext):
+        send_message = Context.send_message
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = True
+            self.platform_manager = SimpleNamespace(platform_insts=[self])
+
+        def meta(self):
+            return SimpleNamespace(id="test", name="test")
+
+        async def send_by_session(self, session, chain):
+            await super().send_message(str(session), chain)
+            if self.fail_once:
+                self.fail_once = False
+                raise TimeoutError("adapter submitted before response timed out")
+
+        def get_config(self, **_kwargs):
+            return {}
+
+    ctx = SubmittedThenFailedContext()
     dispatcher = FollowUpDispatcher(ctx, is_enabled=lambda: True)  # type: ignore[arg-type]
     settings = FAST_SETTINGS
     pending_id = dispatcher.register(
-        session="s1",
-        segments=["二", "三"],
+        session="test:GroupMessage:42",
+        segments=["二", "三", "四"],
         settings=settings,
     )
     pending = dispatcher.pop(pending_id)
     assert pending is not None
     await dispatcher._run(pending)
-    # 首段就失败：剩余段必须合并为一条补发，不能静默丢弃（内容丢失）
-    assert ctx.sent == [("s1", "二\n三")]
+    assert ctx.sent == [
+        ("test:GroupMessage:42", "二"),
+        ("test:GroupMessage:42", "三\n四"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -138,7 +157,7 @@ async def test_follow_up_holds_session_guard_while_sending() -> None:
 async def test_platform_cancelled_send_falls_back_to_merged() -> None:
     """平台适配器被取消时 CancelledError 会穿过 send_message。
 
-    那不是调用方取消：剩余段必须走合并兜底，且不能连坐同会话后面排队的任务。
+    当前段可能已提交，后续段合并补发，且不能连坐同会话后面排队的任务。
     """
 
     class CancelledContext(FakeContext):
@@ -157,7 +176,7 @@ async def test_platform_cancelled_send_falls_back_to_merged() -> None:
     pending = dispatcher.pop(
         dispatcher.register(
             session="s1",
-            segments=["首段", "一", "二"],
+            segments=["首段", "一", "二", "三"],
             settings=settings,
         ),
     )
@@ -166,7 +185,7 @@ async def test_platform_cancelled_send_falls_back_to_merged() -> None:
 
     for task in list(dispatcher._tasks):
         await task
-    assert ctx.sent == [("s1", "一"), ("s1", "一\n二")]
+    assert ctx.sent == [("s1", "一"), ("s1", "二\n三")]
 
 
 @pytest.mark.asyncio
@@ -318,7 +337,8 @@ async def test_orphan_delivery_waits_for_inflight_burst() -> None:
     assert first is not None
     dispatcher.schedule(first)
     await asyncio.wait_for(ctx.started.wait(), timeout=1)
-    stale = dispatcher.register(session="s1", segments=["B1"], settings=settings)
+    stale = dispatcher.register(session="s1", segments=["B0", "B1"], settings=settings)
+    dispatcher._pending[stale].first_send_delivered = True
     dispatcher.flush_stale(stale)
     ctx.release.set()
 
@@ -328,11 +348,10 @@ async def test_orphan_delivery_waits_for_inflight_burst() -> None:
 
 
 @pytest.mark.asyncio
-async def test_expired_pending_is_delivered_merged(
+async def test_expired_pending_without_first_send_is_discarded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """交接钩子没触发时必须兜底交付：首段已替换进原链，剩余段只存在 pending 里，
-    静默清理等于用户收到被插件自己截断的回复。"""
+    """首段未确认发送时过期 pending 只回收，不得自行复活发送整条回复。"""
     from astrbot_plugin_smart_segmentation import follow_up as follow_up_mod
 
     ctx = FakeContext()
@@ -344,7 +363,7 @@ async def test_expired_pending_is_delivered_merged(
     dispatcher.reap_expired()
     for task in list(dispatcher._tasks):
         await task
-    assert ctx.sent == [("s1", "二\n三")]
+    assert ctx.sent == []
 
 
 @pytest.mark.asyncio
@@ -367,9 +386,34 @@ async def test_merged_remainder_respects_stopping_and_disabled(
 
 
 @pytest.mark.asyncio
-async def test_merged_remainder_is_split_at_message_limit() -> None:
+@pytest.mark.parametrize(
+    "interrupt", [None, "disable", "stop", "false", "unknown", "platform_cancel"]
+)
+async def test_merged_remainder_is_split_at_message_limit(
+    interrupt: str | None,
+) -> None:
+    enabled = True
     ctx = FakeContext()
-    dispatcher = FollowUpDispatcher(ctx, is_enabled=lambda: True)  # type: ignore[arg-type]
+    dispatcher = FollowUpDispatcher(ctx, is_enabled=lambda: enabled)  # type: ignore[arg-type]
+    original_send = ctx.send_message
+
+    async def send_then_interrupt(session, chain):
+        nonlocal enabled
+        sent = await original_send(session, chain)
+        if interrupt == "disable":
+            enabled = False
+        elif interrupt == "stop":
+            dispatcher.mark_stopping()
+        elif interrupt == "false":
+            return False
+        elif len(ctx.sent) == 1:
+            if interrupt == "unknown":
+                raise TimeoutError("adapter submitted before response timed out")
+            if interrupt == "platform_cancel":
+                raise asyncio.CancelledError
+        return sent
+
+    ctx.send_message = send_then_interrupt  # type: ignore[method-assign]
     settings = FAST_SETTINGS
     pending = dispatcher.pop(
         dispatcher.register(
@@ -383,6 +427,9 @@ async def test_merged_remainder_is_split_at_message_limit() -> None:
     await dispatcher._send_merged_remainder(pending, 0)
 
     sent = [text for _, text in ctx.sent]
+    if interrupt in {"disable", "stop", "false"}:
+        assert sent == ["a" * 1000 + "\n" + "b" * 499]
+        return
     assert len(sent) > 1
     assert max(map(len, sent)) <= 1500
     assert "".join(sent) == "a" * 1000 + "\n" + "b" * 1000
@@ -440,3 +487,35 @@ async def test_schedule_after_shutdown_creates_no_task() -> None:
     dispatcher.schedule(pending)
     assert dispatcher._tasks == set()
     assert ctx.sent == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_is_bounded_when_task_ignores_cancellation(monkeypatch) -> None:
+    """平台适配器吞掉取消时 terminate 不能无限等，热重载必须能继续。"""
+
+    started = asyncio.Event()
+
+    async def stubborn() -> None:
+        try:
+            started.set()
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            await asyncio.sleep(10)
+
+    dispatcher = FollowUpDispatcher(FakeContext(), is_enabled=lambda: True)  # type: ignore[arg-type]
+    dispatcher._track(stubborn(), "s1")
+    task = next(iter(dispatcher._tasks))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    # 旧实现没有这个常量：raising=False 让红灯落在超时行为上，而不是 AttributeError。
+    monkeypatch.setattr(
+        "astrbot_plugin_smart_segmentation.follow_up.SHUTDOWN_TIMEOUT_SECONDS",
+        0.05,
+        raising=False,
+    )
+    started = asyncio.get_running_loop().time()
+    try:
+        await dispatcher.shutdown()
+        assert asyncio.get_running_loop().time() - started < 1.0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

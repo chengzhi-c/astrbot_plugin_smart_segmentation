@@ -54,18 +54,11 @@ class SmartSegmentationPlugin(Star):
             is_enabled=lambda: self._get_settings() is not None,
         )
         self._streaming: StreamingPatchManager | None = None
-        self._sync_task: asyncio.Task[None] | None = None
         self._warned_builtin_segmentation = False
+        self._warned_host_config_error = False
         self._sync_streaming(self._get_settings())
-        self._start_sync_loop()
-
-    def _start_sync_loop(self) -> None:
-        """流式路径上没有可用 hook（DecorateStage/RespondStage 均提前返回），
-        补丁的装卸不能只靠消息事件驱动，需要独立的周期同步。"""
-        try:
-            self._sync_task = asyncio.get_running_loop().create_task(self._sync_loop())
-        except RuntimeError:
-            logger.debug("智能分段未启动流式补丁周期同步：当前没有运行中的事件循环")
+        # 流式发送会绕过普通消息 hook，补丁装卸和过期补发由周期同步接续。
+        self._sync_task = asyncio.create_task(self._sync_loop())
 
     async def _sync_loop(self) -> None:
         while not self._stopping:
@@ -74,9 +67,7 @@ class SmartSegmentationPlugin(Star):
                 if self._stopping:
                     return
                 self._sync_streaming(self._get_settings())
-                # 顺带兜底交付过期未认领的补发段：交接钩子没触发时（发送流程根本没
-                # 走到 after_message_sent，例如别的插件在装饰阶段就停掉了事件）没有
-                # 别的地方能回收它。
+                # 顺带回收交接钩子没触发的过期 pending；送达则续发余段，明确失败才重试整轮。
                 self._follow_ups.reap_expired()
             except asyncio.CancelledError:
                 raise
@@ -100,7 +91,8 @@ class SmartSegmentationPlugin(Star):
             return ""
         try:
             return str(getter() or "").strip()
-        except Exception:
+        except Exception as exc:
+            logger.debug("读取结果纯文本失败: %s", brief_exception(exc))
             return ""
 
     def _host_segmented_reply_enabled(self, event: AstrMessageEvent) -> bool:
@@ -116,7 +108,14 @@ class SmartSegmentationPlugin(Star):
             config = self.context.get_config(event.unified_msg_origin)
             platform_settings = config.get("platform_settings", {}) or {}
             segmented = platform_settings.get("segmented_reply", {}) or {}
-        except Exception:
+        except Exception as exc:
+            if not self._warned_host_config_error:
+                self._warned_host_config_error = True
+                logger.warning(
+                    "读取宿主分段回复配置失败,按未启用处理;"
+                    "若宿主已开启内置分段会出现双重切分: %s",
+                    brief_exception(exc),
+                )
             return False
         return bool(isinstance(segmented, dict) and segmented.get("enable"))
 
@@ -284,15 +283,16 @@ class SmartSegmentationPlugin(Star):
             self._follow_ups.clear_extras(event)
             return
 
-        first_send_delivered = self._follow_ups.first_send_delivered(event)
         pending = self._follow_ups.pop(pending_id)
         self._follow_ups.clear_extras(event)
         if pending is None or not pending.segments:
             return
+        if not pending.first_send_delivered and not pending.first_send_failed:
+            return
 
         self._follow_ups.schedule(
             pending,
-            start_index=1 if first_send_delivered else 0,
+            start_index=1 if pending.first_send_delivered else 0,
         )
 
     async def terminate(self) -> None:
@@ -300,7 +300,7 @@ class SmartSegmentationPlugin(Star):
         self._segmenter.mark_stopping()
         self._follow_ups.mark_stopping()
         try:
-            if self._sync_task is not None and not self._sync_task.done():
+            if not self._sync_task.done():
                 self._sync_task.cancel()
                 try:
                     await self._sync_task

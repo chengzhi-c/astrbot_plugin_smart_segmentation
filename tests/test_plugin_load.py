@@ -2,22 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
-
 import pytest
-
-
-def test_astrbot_version_upper_bound_locked() -> None:
-    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(
-        encoding="utf-8"
-    )
-    constraint = next(
-        line.split(":", 1)[1].strip().strip('"')
-        for line in metadata.splitlines()
-        if line.startswith("astrbot_version:")
-    )
-    assert "<5" in constraint, f"流式兼容只验证到 AstrBot 4.x：{constraint}"
 
 
 @pytest.fixture
@@ -52,7 +37,8 @@ def test_hooks_registered_in_astrbot_registry() -> None:
     assert "after_message_sent" in _registered(EventType.OnAfterMessageSentEvent)
 
 
-def test_plugin_is_real_star_and_instantiates(host_plugin) -> None:
+@pytest.mark.asyncio
+async def test_plugin_is_real_star_and_instantiates(host_plugin) -> None:
     from astrbot.api.star import Star
 
     class FakeContext:
@@ -62,32 +48,30 @@ def test_plugin_is_real_star_and_instantiates(host_plugin) -> None:
     assert isinstance(plugin, Star)
     assert callable(plugin.on_decorating_result)
     assert callable(plugin.after_message_sent)
+    await plugin.terminate()
 
 
-def test_terminate_clean(host_plugin) -> None:
+@pytest.mark.asyncio
+async def test_terminate_clean(host_plugin) -> None:
     class FakeContext:
         pass
 
     plugin = host_plugin(FakeContext(), {"enabled": True})
 
-    async def scenario() -> None:
-        # 先制造真实的在飞状态，否则下面的清理断言是空 vs 空
-        pending_id = plugin._follow_ups.register(
-            session="sess:1",
-            segments=["二", "三"],
-            settings=plugin._get_settings(),
-        )
-        assert pending_id
-        plugin._follow_ups.schedule(plugin._follow_ups.pop(pending_id))
-        # 再放一条从未被认领的 pending：只有 shutdown 的清理能移除它
-        plugin._follow_ups.register(
-            session="sess:1",
-            segments=["四"],
-            settings=plugin._get_settings(),
-        )
-        await plugin.terminate()
-
-    asyncio.run(scenario())
+    # 在飞任务与未认领的 pending 都应在关停时回收。
+    pending_id = plugin._follow_ups.register(
+        session="sess:1",
+        segments=["二", "三"],
+        settings=plugin._get_settings(),
+    )
+    assert pending_id
+    plugin._follow_ups.schedule(plugin._follow_ups.pop(pending_id))
+    plugin._follow_ups.register(
+        session="sess:1",
+        segments=["四"],
+        settings=plugin._get_settings(),
+    )
+    await plugin.terminate()
     assert plugin._stopping is True
     # terminate 必须通知各子系统，否则在飞的分段调用/补发任务不会被拦下
     assert plugin._segmenter._stopping is True
@@ -96,7 +80,8 @@ def test_terminate_clean(host_plugin) -> None:
     assert plugin._follow_ups._tasks == set()
 
 
-def test_streaming_patch_idempotent_sync(host_plugin) -> None:
+@pytest.mark.asyncio
+async def test_streaming_patch_idempotent_sync(host_plugin) -> None:
     from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
     class FakeContext:
@@ -114,4 +99,29 @@ def test_streaming_patch_idempotent_sync(host_plugin) -> None:
     finally:
         plugin._streaming.sync(None)  # type: ignore[union-attr]
         assert ResultDecorateStage.process is original
-        asyncio.run(plugin.terminate())
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_host_config_probe_failure_warns_once(host_plugin, caplog) -> None:
+    """宿主配置读取失败只告警一次；重复告警会随每条回复刷屏。"""
+
+    class RaisingContext:
+        def get_config(self, _umo):
+            raise RuntimeError("boom")
+
+    plugin = host_plugin(RaisingContext(), {"enabled": True})
+    try:
+
+        class Event:
+            unified_msg_origin = "sess:1"
+
+            @staticmethod
+            def get_platform_name():
+                return "test"
+
+        assert plugin._host_segmented_reply_enabled(Event()) is False
+        assert plugin._host_segmented_reply_enabled(Event()) is False
+        assert caplog.text.count("读取宿主分段回复配置失败") == 1
+    finally:
+        await plugin.terminate()

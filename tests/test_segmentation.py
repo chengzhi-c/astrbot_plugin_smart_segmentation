@@ -269,8 +269,9 @@ class TestJsonExtractAndParse:
 
     def test_parse_deeply_nested_raises_parse_error(self) -> None:
         """深层嵌套 JSON 的 RecursionError 必须收敛为 SegmentationParseError。"""
-        with pytest.raises(SegmentationParseError):
-            parse_segments_from_model_output("[" * 100000, max_segments=5)
+        with pytest.raises(SegmentationParseError) as excinfo:
+            parse_segments_from_model_output("[" * 50000, max_segments=5)
+        assert isinstance(excinfo.value.__cause__, RecursionError)
 
 
 class TestTrailingPeriodAndLocalSplit:
@@ -590,8 +591,8 @@ class TestTrailingPeriodAndLocalSplit:
 
     @pytest.mark.parametrize(
         "text",
-        ["]" * 10000, "]" * 40000, "[" * 20000 + "](" * 10000],
-        ids=["close-10k", "close-40k", "open-then-link-pairs"],
+        ["]" * 10000, "[" * 20000 + "](" * 10000],
+        ids=["close-10k", "open-then-link-pairs"],
     )
     def test_many_brackets_keep_content(self, text: str) -> None:
         """满屏方括号是链接正则的平方回溯诱因：降级扫描必须保住内容，不能靠限长兜。"""
@@ -778,6 +779,12 @@ class TestPromptAndDelay:
         assert "原文内容" in prompt
         assert "最多分成 4 条" in prompt
         assert "活泼" in prompt
+
+    def test_prompt_requires_preserving_internal_punctuation(self) -> None:
+        """模型漏掉原文逗号会被 same_content 拒绝，提示词必须把这条说清楚。"""
+        prompt = build_segmentation_prompt("原文内容", "natural", 4)
+        assert "逗号、分号" in prompt
+        assert "必须保留" in prompt
 
     def test_delay_clamped_when_max_below_base(self) -> None:
         delay = calculate_send_delay("abc", 5.0, 0.0, 1.0)

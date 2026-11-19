@@ -6,17 +6,17 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.event import MessageChain, MessageEventResult, ResultContentType
+from astrbot.api.message_components import At, ComponentType, Image, Node, Plain, Record
+from astrbot.core.pipeline.respond.stage import RespondStage
 from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
 
 
-class FakeResult:
+class FakeResult(MessageEventResult):
     def __init__(self, text: str) -> None:
-        self.chain = [Plain(text)]
-        self.is_llm_result = lambda: True
-        # 宿主实现：把链里 Plain 的文本拼起来（多段用空格 join）
-        self.get_plain_text = lambda: " ".join(
-            comp.text for comp in self.chain if isinstance(comp, Plain)
+        super().__init__(
+            chain=[Plain(text)],
+            result_content_type=ResultContentType.LLM_RESULT,
         )
 
 
@@ -68,7 +68,11 @@ class FakeContext:
 
 
 @pytest.mark.asyncio
-async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("legacy_wrapper", [False, True])
+async def test_plugin_end_to_end_reuses_event_after_reload(
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_wrapper: bool,
+) -> None:
     monkeypatch.setattr(
         "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
         lambda *_a, **_k: 0.0,
@@ -88,11 +92,32 @@ async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     result = FakeResult("今天天气不错我们出去玩吧")
     event = FakeEvent(result)
+    if legacy_wrapper:
+        dispatcher = plugin._follow_ups
+        original_send = event.send
+
+        async def legacy_send(message):
+            sent = await original_send(message)
+            pending_id = dispatcher.pending_id_of(event)
+            if (
+                pending_id
+                and dispatcher.is_first_segment_send(event, pending_id, message)
+                and pending_id in dispatcher._pending
+            ):
+                if sent is False:
+                    dispatcher._pending[pending_id].first_send_failed = True
+                else:
+                    dispatcher._pending[pending_id].first_send_delivered = True
+            return sent
+
+        event.send = legacy_send
+        event.set_extra("smart_segmentation_first_send_tracked", True)
 
     await plugin.on_decorating_result(event)  # type: ignore[arg-type]
     # first segment replaced in place, follow-up registered
     assert [c.text for c in result.chain] == ["今天天气不错"]
     assert plugin._follow_ups.pending_id_of(event)  # type: ignore[attr-defined]
+    send_wrapper = event.send
 
     # re-decorate same result is a no-op
     calls_before = len(ctx.generate_calls)
@@ -107,6 +132,199 @@ async def test_plugin_end_to_end(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.sent == [("sess:1", "我们出去玩吧")]
 
     await plugin.terminate()
+
+    ctx.sent.clear()
+    event._result = FakeResult("今天天气不错我们出去玩吧")
+    reloaded = SmartSegmentationPlugin(ctx, plugin.config)  # type: ignore[arg-type]
+    try:
+        await reloaded.on_decorating_result(event)  # type: ignore[arg-type]
+        assert event.send is send_wrapper
+        await event.send(event.get_result())
+        await reloaded.after_message_sent(event)  # type: ignore[arg-type]
+        await asyncio.gather(*list(reloaded._follow_ups._tasks))
+        assert ctx.sent == [("sess:1", "我们出去玩吧")]
+    finally:
+        await reloaded.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("conversion", "send_result", "derive"),
+    [
+        ("plain", None, True),
+        ("tts", None, True),
+        ("tts", False, True),
+        ("tts-dual", None, True),
+        ("t2i", None, True),
+        ("forward", None, True),
+        ("tts-prefix", None, True),
+        ("tts", None, False),
+        ("tts-prefix", None, False),
+        ("tts-legacy", None, False),
+        ("tts-dual-legacy", None, False),
+        ("tts-dual-legacy-plain-rejected", None, False),
+        ("t2i", None, False),
+        ("forward", None, False),
+    ],
+)
+async def test_respond_stage_derived_chain_keeps_followups_after_conversion(
+    conversion: str,
+    send_result: bool | None,
+    derive: bool,
+) -> None:
+    """宿主转换首段后仍须认领其发送；Record 会先从原链抽走。"""
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(
+        ctx,
+        {
+            "enabled": True,
+            "min_length": 2,
+            "delay_base": 0,
+            "delay_per_char": 0,
+            "delay_max": 0,
+        },
+    )
+    result = FakeResult("今天天气不错我们出去玩吧")
+    result.chain.insert(0, At(qq="123"))
+    event = FakeEvent(result)
+
+    async def send(message):
+        event.sent.append(message)
+        if conversion == "tts-dual-legacy-plain-rejected" and any(
+            isinstance(component, Plain) for component in message.chain
+        ):
+            return False
+        return send_result
+
+    event.send = send
+    try:
+        await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        await event.send(MessageChain([result.chain[0]]))
+        pending_id = plugin._follow_ups.pending_id_of(event)
+        pending = plugin._follow_ups._pending[pending_id]
+        assert not pending.first_send_delivered and not pending.first_send_failed
+
+        first_plain = result.chain[-1]
+        if conversion == "tts-prefix":
+            first_plain.text = "回复前缀：" + first_plain.text
+        if conversion.startswith("tts"):
+            result.chain = [
+                Record(
+                    file="file:///speech.wav",
+                    text=first_plain.text,
+                )
+            ]
+            if "legacy" in conversion:
+                delattr(result.chain[0], "text")
+            if "dual" in conversion:
+                result.chain.append(first_plain)
+        elif conversion == "t2i":
+            result.chain = [Image.fromURL("https://example.com/rendered.png")]
+        elif conversion == "forward":
+            result.chain = [Node(uin="bot", name="AstrBot", content=[first_plain])]
+
+        await event.send(MessageChain([Plain("独立发送的其他内容")]))
+        assert not pending.first_send_delivered and not pending.first_send_failed
+
+        make_chain = result.derive if derive else MessageChain
+        records = RespondStage()._extract_comp(result.chain, {ComponentType.Record})
+        for record in records:
+            await event.send(make_chain([record]))
+        if result.chain:
+            await event.send(make_chain(result.chain))
+        await plugin.after_message_sent(event)  # type: ignore[arg-type]
+        await asyncio.gather(*list(plugin._follow_ups._tasks))
+
+        expected = [("sess:1", "我们出去玩吧")]
+        if send_result is False:
+            expected.insert(0, ("sess:1", "今天天气不错"))
+        assert ctx.sent == expected
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_respond_stage_derived_chain_orphan_only_sends_remainder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from astrbot_plugin_smart_segmentation import follow_up as follow_up_mod
+
+    monkeypatch.setattr(follow_up_mod, "PENDING_FOLLOW_UP_TTL_SECONDS", 0.0)
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(
+        ctx,
+        {
+            "enabled": True,
+            "min_length": 2,
+            "delay_base": 0,
+            "delay_per_char": 0,
+            "delay_max": 0,
+        },
+    )
+    result = FakeResult("今天天气不错我们出去玩吧")
+    event = FakeEvent(result)
+
+    await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+    await event.send(MessageChain(result.chain))
+    plugin._follow_ups.reap_expired()  # type: ignore[attr-defined]
+    for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
+        await task
+
+    assert ctx.sent == [("sess:1", "我们出去玩吧")]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("send_first", "send_result", "expected_follow_ups"),
+    [
+        (False, None, []),
+        (True, None, ["我们出去玩吧"]),
+        (True, False, ["今天天气不错\n我们出去玩吧"]),
+    ],
+    ids=["suppressed-before-send", "sent-without-after-hook", "rejected-before-send"],
+)
+async def test_expired_pending_only_sends_remainder_after_first_send(
+    monkeypatch: pytest.MonkeyPatch,
+    send_first: bool,
+    send_result: bool | None,
+    expected_follow_ups: list[str],
+) -> None:
+    """孤儿回收不能复活已抑制的回复，也不能重复发送已送达的首段。"""
+    from astrbot_plugin_smart_segmentation import follow_up as follow_up_mod
+
+    monkeypatch.setattr(follow_up_mod, "PENDING_FOLLOW_UP_TTL_SECONDS", 0.0)
+    ctx = FakeContext()
+    plugin = SmartSegmentationPlugin(
+        ctx,
+        {
+            "enabled": True,
+            "min_length": 2,
+            "delay_base": 0,
+            "delay_per_char": 0,
+            "delay_max": 0,
+        },
+    )
+    result = FakeResult("今天天气不错我们出去玩吧")
+    event = FakeEvent(result)
+    if send_result is False:
+
+        async def rejected_send(_message):
+            return False
+
+        event.send = rejected_send
+
+    try:
+        await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+        if send_first:
+            await event.send(result)
+
+        plugin._follow_ups.reap_expired()  # type: ignore[attr-defined]
+        await asyncio.gather(*list(plugin._follow_ups._tasks))  # type: ignore[attr-defined]
+
+        assert [text for _session, text in ctx.sent] == expected_follow_ups
+    finally:
+        await plugin.terminate()
 
 
 @pytest.mark.asyncio
@@ -138,8 +356,17 @@ async def test_plugin_does_not_send_invisible_segments_with_mention(
 
 
 @pytest.mark.asyncio
-async def test_first_segment_failure_restores_the_full_reply(
+@pytest.mark.parametrize(
+    ("send_outcome", "expected_follow_ups"),
+    [
+        ("unknown", []),
+        ("rejected", [("sess:1", "今天天气不错"), ("sess:1", "我们出去玩吧")]),
+    ],
+)
+async def test_first_send_retries_only_when_rejected(
     monkeypatch: pytest.MonkeyPatch,
+    send_outcome: str,
+    expected_follow_ups: list[tuple[str, str]],
 ) -> None:
     monkeypatch.setattr(
         "astrbot_plugin_smart_segmentation.follow_up.calculate_send_delay",
@@ -148,7 +375,9 @@ async def test_first_segment_failure_restores_the_full_reply(
 
     class FailingEvent(FakeEvent):
         async def send(self, message):
-            raise RuntimeError("platform send failed")
+            if send_outcome == "unknown":
+                raise RuntimeError("platform send failed")
+            return False
 
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
@@ -165,15 +394,15 @@ async def test_first_segment_failure_restores_the_full_reply(
     event = FailingEvent(result)
     try:
         await plugin.on_decorating_result(event)  # type: ignore[arg-type]
-        with pytest.raises(RuntimeError, match="platform send failed"):
-            await event.send(result)
+        if send_outcome == "unknown":
+            with pytest.raises(RuntimeError, match="platform send failed"):
+                await event.send(result)
+        else:
+            assert await event.send(result) is False
 
         await plugin.after_message_sent(event)  # type: ignore[arg-type]
         await asyncio.gather(*list(plugin._follow_ups._tasks))  # type: ignore[attr-defined]
-        assert ctx.sent == [
-            ("sess:1", "今天天气不错"),
-            ("sess:1", "我们出去玩吧"),
-        ]
+        assert ctx.sent == expected_follow_ups
     finally:
         await plugin.terminate()
 
@@ -386,11 +615,22 @@ async def test_plugin_keeps_segmenting_where_host_skips_builtin_segmentation() -
 
 
 @pytest.mark.asyncio
-async def test_plugin_skips_model_call_when_stopping() -> None:
+@pytest.mark.parametrize("stop_during_provider_lookup", [False, True])
+async def test_plugin_skips_model_call_when_stopping(
+    stop_during_provider_lookup: bool,
+) -> None:
     """停止中不要再打一次分段模型：既浪费额度，也会拖住卸载。"""
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(ctx, {"enabled": True, "min_length": 2})  # type: ignore[arg-type]
-    plugin._stopping = True
+    if stop_during_provider_lookup:
+
+        async def stop_during_lookup(umo):
+            await plugin.terminate()
+            return "p1"
+
+        ctx.get_current_chat_provider_id = stop_during_lookup  # type: ignore[method-assign]
+    else:
+        plugin._stopping = True
     result = FakeResult("你好。世界。继续说一点")
     event = FakeEvent(result)
 
@@ -486,9 +726,10 @@ async def test_sync_loop_reaps_expired_pending(
     assert settings is not None
     plugin._follow_ups.register(  # type: ignore[attr-defined]
         session="sess:1",
-        segments=["二", "三"],
+        segments=["一", "二", "三"],
         settings=settings,
     )
+    next(iter(plugin._follow_ups._pending.values())).first_send_delivered = True  # type: ignore[attr-defined]
 
     await asyncio.wait_for(ctx.delivered.wait(), timeout=1)
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
@@ -567,6 +808,7 @@ async def test_guarded_decorate_clears_stale_bookkeeping() -> None:
     await plugin.on_decorating_result(event)  # type: ignore[arg-type]
     stale_id = plugin._follow_ups.pending_id_of(event)  # type: ignore[attr-defined]
     assert stale_id
+    await event.send(MessageChain(result.chain))
     assert stale_id in plugin._follow_ups._pending  # type: ignore[attr-defined]
 
     # 模拟：上一轮登记了 pending，但 RespondStage 被跳过；本轮同 event 被守卫挡住
@@ -578,15 +820,14 @@ async def test_guarded_decorate_clears_stale_bookkeeping() -> None:
     # 清簿记不能等于丢内容：剩余段要合并补发出去
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
         await task
-    assert ctx.sent == [("sess:1", "今天天气不错\n我们出去玩吧")]
+    assert ctx.sent == [("sess:1", "我们出去玩吧")]
 
     await plugin.terminate()
 
 
 @pytest.mark.asyncio
 async def test_stale_pending_from_previous_round_is_delivered() -> None:
-    """同一事件上一轮登记了 pending 但没触发 after_message_sent（宿主判空/第三方插件
-    不调）：这一轮要先把它交付掉，而不是被本轮 after_message_sent 认领。"""
+    """上一轮首段已发送但没有 after hook 时，下一轮先交付余段。"""
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(  # type: ignore[arg-type]
         ctx,
@@ -603,6 +844,7 @@ async def test_stale_pending_from_previous_round_is_delivered() -> None:
     await plugin.on_decorating_result(event)  # type: ignore[arg-type]
     stale_id = plugin._follow_ups.pending_id_of(event)  # type: ignore[attr-defined]
     assert stale_id
+    await event.send(MessageChain(first.chain))
 
     # 宿主再次进入装饰钩子（同一 event，新 result），而上一轮的 after 钩子没触发
     event._result = FakeResult("新的回复。第二段内容")  # type: ignore[attr-defined]
@@ -610,7 +852,7 @@ async def test_stale_pending_from_previous_round_is_delivered() -> None:
 
     for task in list(plugin._follow_ups._tasks):  # type: ignore[attr-defined]
         await task
-    assert ("sess:1", "今天天气不错\n我们出去玩吧") in ctx.sent
+    assert ("sess:1", "我们出去玩吧") in ctx.sent
     assert plugin._follow_ups.pending_id_of(event) != stale_id  # type: ignore[attr-defined]
 
     await plugin.terminate()

@@ -19,5 +19,7 @@ MAX_STREAMING_MAX_CHARS = 300
 PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 DELAY_JITTER_SECONDS = 0.15
 STREAMING_SYNC_INTERVAL_SECONDS = 30.0
+# 关停等待上限：平台适配器可能吞掉取消，terminate 不能无限等一个补发任务。
+SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 ALLOWED_STYLES = frozenset({"natural", "conservative", "active"})

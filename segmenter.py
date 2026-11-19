@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -41,6 +40,8 @@ class OutboundSegmenter:
             return []
 
         provider_id = await self.resolve_provider_id(event, settings)
+        if self._stopping:
+            return []
         segments: list[str] | None = None
         if provider_id:
             try:
@@ -63,9 +64,10 @@ class OutboundSegmenter:
                     settings.timeout_seconds,
                 )
             except SegmentationParseError as exc:
+                # 文案由本模块固定构造（解析失败 / 与原文不一致），不含模型原文。
                 logger.warning(
-                    "智能分段模型输出无法解析,本次按标点拆分: %s",
-                    brief_exception(exc),
+                    "智能分段模型输出不可用,本次按标点拆分: %s",
+                    exc,
                 )
             except Exception as exc:
                 logger.warning(
@@ -112,9 +114,9 @@ class OutboundSegmenter:
         settings: SegmentationSettings,
     ) -> list[str]:
         prompt = build_segmentation_prompt(text, settings.style, settings.max_segments)
-        response = await self._llm_generate(
-            provider_id=provider_id,
+        response = await self._context.llm_generate(
             prompt=prompt,
+            chat_provider_id=provider_id,
         )
         raw_text = str(getattr(response, "completion_text", "") or "").strip()
         if not raw_text:
@@ -127,17 +129,3 @@ class OutboundSegmenter:
             # 模型漏字/改写时不能拿它的结果替换原链：交给调用方走本地兜底
             raise SegmentationParseError("分段结果与原文不一致")
         return segments
-
-    async def _llm_generate(
-        self,
-        *,
-        provider_id: str,
-        prompt: str,
-    ) -> Any:
-        # 只传 prompt 与 provider：宿主 4.16-4.29 的 llm_generate 把其余 kwargs
-        # 原样交给 provider，而 openai/gemini/anthropic 的 text_chat 全部丢弃，
-        # temperature / max_tokens 传过去也不生效。
-        return await self._context.llm_generate(
-            prompt=prompt,
-            chat_provider_id=provider_id,
-        )

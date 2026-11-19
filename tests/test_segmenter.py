@@ -57,7 +57,7 @@ async def test_segment_preserves_format_characters_inside_visible_text() -> None
 
 
 @pytest.mark.asyncio
-async def test_segment_rejects_model_output_that_changed_text() -> None:
+async def test_segment_rejects_model_output_that_changed_text(caplog) -> None:
     """模型漏字/改写时不能拿它的结果替换原链：用户会收到一条被改残的回复。"""
     ctx = FakeContext()
 
@@ -76,6 +76,28 @@ async def test_segment_rejects_model_output_that_changed_text() -> None:
     )
     # 退回本地切分：漏掉的那句必须还在
     assert "".join(segs).replace("。", "") == text.replace("。", "")
+    assert "分段结果与原文不一致" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_segment_accepts_comma_kept_at_boundary() -> None:
+    """模型把逗号留在段尾是合法切分：内容没变，不能退回本地兜底。"""
+    ctx = FakeContext()
+
+    async def comma_generate(**kwargs):
+        return SimpleNamespace(
+            completion_text='["已经在回了，别急，", "你这不是困了是心累了吧"]',
+        )
+
+    ctx.llm_generate = comma_generate  # type: ignore[method-assign]
+    segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
+    text = "已经在回了，别急，你这不是困了是心累了吧"
+    segs = await segmenter.segment(
+        SimpleNamespace(unified_msg_origin="sess:1"),  # type: ignore[arg-type]
+        text,
+        SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5),
+    )
+    assert segs == ["已经在回了，别急，", "你这不是困了是心累了吧"]
 
 
 @pytest.mark.asyncio
@@ -167,15 +189,14 @@ async def test_segment_prefers_configured_provider_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_segment_cancelled_when_stopping_raises() -> None:
+async def test_segment_skips_model_when_stopping() -> None:
     ctx = FakeContext()
-    ctx.raise_cancelled = True
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
     segmenter.mark_stopping()
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
-    with pytest.raises(asyncio.CancelledError):
-        await segmenter.segment(event, "第一句。第二句。", settings)  # type: ignore[arg-type]
+    assert await segmenter.segment(event, "第一句。第二句。", settings) == []  # type: ignore[arg-type]
+    assert ctx.generate_calls == []
 
 
 class SyncProviderContext(FakeContext):

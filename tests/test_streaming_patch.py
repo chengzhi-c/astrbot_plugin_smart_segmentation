@@ -4,7 +4,6 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 from astrbot_plugin_smart_segmentation.streaming.patches import (
     _PATCH_OWNER_ATTR,
@@ -214,6 +213,53 @@ async def test_dead_patch_restored_by_third_party_detaches_on_first_call() -> No
         assert ResultDecorateStage.process is fake_process
     finally:
         ResultDecorateStage.process = original
+
+
+def test_restore_failure_keeps_original_for_retry(caplog) -> None:
+    """挂回失败时保留状态，下一次 sync 还能重试，不能把补丁永久留在宿主上。"""
+    from astrbot_plugin_smart_segmentation.streaming import patches as patches_mod
+
+    async def original(stage_self, event):
+        yield "sentinel"
+
+    async def ours(stage_self, event):
+        yield "sentinel"
+
+    setattr(ours, patches_mod._PATCH_OWNER_ATTR, "mine")
+    setattr(ours, patches_mod._PATCH_ORIGINAL_ATTR, original)
+    setattr(ours, patches_mod._PATCH_INSTANCE_ATTR, 1)
+
+    class HolderMeta(type):
+        fail = False
+
+        def __setattr__(cls, name, value):
+            if name == patches_mod._TARGET_ATTR and cls.fail:
+                raise RuntimeError("boom")
+            super().__setattr__(name, value)
+
+    class Holder(metaclass=HolderMeta):
+        process = ours
+
+    setattr(Holder, patches_mod._HOST_ORIGINAL_ATTR, original)
+    manager = _manager("mine")
+    manager._holder = Holder
+    manager._installed = True
+    manager._original = original
+
+    Holder.fail = True
+    manager._restore()
+    manager._restore()
+    assert Holder.process is ours
+    assert manager._installed is True
+    assert manager._original is original
+    assert caplog.text.count("将在下次同步重试") == 1
+
+    Holder.fail = False
+    manager._restore()
+    assert Holder.process is original
+    assert manager._installed is False
+    assert manager._original is None
+    assert getattr(Holder, patches_mod._HOST_ORIGINAL_ATTR, None) is None
 
 
 def test_decoration_failure_does_not_block_the_message(monkeypatch) -> None:
