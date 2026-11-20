@@ -6,6 +6,9 @@ code never accepts values above these ceilings.
 
 from __future__ import annotations
 
+PLUGIN_NAME = "astrbot_plugin_smart_segmentation"
+DEFAULT_TAIL_CLEAN_MARKS = ".,，。;；:：、"
+
 # Keep in sync with _conf_schema.json slider max for user-facing fields.
 MAX_MIN_LENGTH = 200
 MAX_SEGMENTS = 20
@@ -15,6 +18,7 @@ MAX_DELAY_MAX = 10.0
 MAX_DELAY_PER_CHAR = 0.2
 MAX_STREAMING_MIN_CHARS = 80
 MAX_STREAMING_MAX_CHARS = 300
+MAX_SEGMENT_CHARS = 1500
 
 PENDING_FOLLOW_UP_TTL_SECONDS = 60.0
 DELAY_JITTER_SECONDS = 0.15

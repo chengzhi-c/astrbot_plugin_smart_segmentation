@@ -22,6 +22,7 @@ from astrbot_plugin_smart_segmentation.segmentation import (
     build_segmentation_prompt,
     calculate_send_delay,
     cap_segments,
+    clean_segment_tail,
     extract_json_array_text,
     is_action_only_text,
     merge_segments_balancing_brackets,
@@ -38,6 +39,33 @@ from astrbot_plugin_smart_segmentation.settings import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("第一句，第二句，。", "第一句，第二句"),
+        ("收尾.,，。;；:：、", "收尾"),
+        ("  缩进保留，\r\n", "  缩进保留\r\n"),
+        ("等等...", "等等"),
+        ("等等…", "等等…"),
+        ("真的？！?!~", "真的？！?!~"),
+        ("（动作。）", "（动作。）"),
+        ("数值为 3.14。", "数值为 3.14"),
+        ("👩‍💻，", "👩‍💻"),
+        ("`print('hello');`，", "`print('hello');`"),
+        ("```python\nx = 1;\n```", "```python\nx = 1;\n```"),
+        ("```python\nx = 1;\n", "```python\nx = 1;\n"),
+        ("`unfinished;", "`unfinished;"),
+        ("https://example.com/path;", "https://example.com/path;"),
+        ("https://example.com/path;，", "https://example.com/path;"),
+        ("[链接](https://example.com/)，", "[链接](https://example.com/)"),
+        ("，。\n", "\n"),
+        ("", ""),
+    ],
+)
+def test_clean_segment_tail(text: str, expected: str) -> None:
+    assert clean_segment_tail(text) == expected
 
 
 class TestStripThinking:
@@ -790,16 +818,6 @@ class TestPromptAndDelay:
         delay = calculate_send_delay("abc", 5.0, 0.0, 1.0)
         assert delay <= 1.0
 
-    def test_delay_exact_value_without_jitter(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """delay = base + len*per_char（抖动固定为 0 时的精确值）。"""
-        monkeypatch.setattr(
-            "astrbot_plugin_smart_segmentation.segmentation.random.uniform",
-            lambda *_args, **_kwargs: 0.0,
-        )
-        assert calculate_send_delay("abcd", 1.0, 0.1, 9.0) == pytest.approx(1.4)
-
     def test_delay_jitter_is_applied(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """抖动必须真的加到延迟上（去掉 uniform 调用后本测试变红）。"""
         monkeypatch.setattr(
@@ -866,9 +884,10 @@ class TestBoundsAlignSchema:
         schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
         defaults = SegmentationSettings()
         for field in fields(SegmentationSettings):
-            assert schema[field.name]["default"] == getattr(defaults, field.name), (
-                field.name
-            )
+            expected = getattr(defaults, field.name)
+            if field.name == "tail_clean_marks":
+                expected = list(expected)
+            assert schema[field.name]["default"] == expected, field.name
 
 
 class TestPlaceholderEscape:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
-# 先初始化宿主插件 API，避免旧版宿主直接导入管线时循环导入。
-import astrbot.api.star  # noqa: F401
+# 测试不上传宿主统计；先设置再导入插件 API。
+os.environ["ASTRBOT_DISABLE_METRICS"] = "1"
+import astrbot.api.star  # noqa: E402, F401
 
 PKG_NAME = "astrbot_plugin_smart_segmentation"
 

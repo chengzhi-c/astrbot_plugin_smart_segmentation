@@ -18,6 +18,7 @@ from ..settings import SegmentationSettings
 from .wrapper import decorate_streaming_result
 
 _PATCH_OWNER_ATTR = "_smart_segmentation_patch_owner"
+_PATCH_FUNCTION_ATTR = "_smart_segmentation_patch_function"
 _PATCH_ORIGINAL_ATTR = "_smart_segmentation_patch_original"
 _PATCH_INSTANCE_ATTR = "_smart_segmentation_patch_instance"
 _PATCH_SEQUENCE_ATTR = "_smart_segmentation_patch_sequence"
@@ -87,7 +88,11 @@ class StreamingPatchManager:
         return getattr(self._holder, _TARGET_ATTR, None)
 
     def _owns_current_patch(self) -> bool:
-        return getattr(self._current(), _PATCH_OWNER_ATTR, None) == self._owner_token
+        current = self._current()
+        return (
+            getattr(current, _PATCH_OWNER_ATTR, None) == self._owner_token
+            and getattr(current, _PATCH_FUNCTION_ATTR, current) is current
+        )
 
     def _recoverable_original(self) -> Callable[..., Any] | None:
         current = self._current()
@@ -130,8 +135,15 @@ class StreamingPatchManager:
             from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
 
             self._holder = ResultDecorateStage
+            if self._superseded():
+                self._retired = True
+                self._installed = False
+                return
             current = self._current()
             owner = getattr(current, _PATCH_OWNER_ATTR, None)
+            # functools.wraps 会复制标记，函数身份才能区分第三方包装和原补丁。
+            if getattr(current, _PATCH_FUNCTION_ATTR, current) is not current:
+                owner = None
             if owner == self._owner_token:
                 if self._original is None:
                     self._original = self._recoverable_original()
@@ -140,12 +152,6 @@ class StreamingPatchManager:
                 return
             is_ours = owner is not None and hasattr(current, _PATCH_ORIGINAL_ATTR)
             if is_ours:
-                if self._superseded():
-                    # 更新的实例已接管：本实例退休，避免两边来回抢槽位。
-                    self._retired = True
-                    self._installed = False
-                    self._blocked_on = current
-                    return
                 host_original = self._recoverable_original()
                 if host_original is None:
                     self._installed = False
@@ -217,6 +223,7 @@ class StreamingPatchManager:
                 yield item
 
         setattr(patched_process, _PATCH_OWNER_ATTR, self._owner_token)
+        setattr(patched_process, _PATCH_FUNCTION_ATTR, patched_process)
         setattr(patched_process, _PATCH_ORIGINAL_ATTR, original)
         setattr(patched_process, _PATCH_INSTANCE_ATTR, self._instance_id)
         setattr(self._holder, _HOST_ORIGINAL_ATTR, original)

@@ -68,6 +68,96 @@ class FakeContext:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_model", [False, True])
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({"tail_clean_enabled": False}, ["开头，句中，，", "第二句", "末尾？！"]),
+        ({}, ["开头，句中", "第二句", "末尾？！"]),
+        ({"tail_clean_marks": ["？", "！"]}, ["开头，句中，，", "第二句。", "末尾"]),
+        ({"tail_clean_marks": ["，"]}, ["开头，句中", "第二句。", "末尾？！"]),
+        ({"tail_clean_marks": []}, ["开头，句中，，", "第二句。", "末尾？！"]),
+    ],
+)
+async def test_tail_clean_reaches_first_and_followups(
+    config, expected, use_model, caplog
+):
+    segments = ["开头，句中，，", "第二句。", "末尾？！"]
+    ctx = FakeContext(json.dumps(segments) if use_model else "not-json")
+    plugin = SmartSegmentationPlugin(
+        ctx,
+        {
+            "min_length": 2,
+            "delay_max": 0,
+            "tail_clean_enabled": True,
+            **config,
+        },
+    )
+    event = FakeEvent(FakeResult("\n".join(segments)))
+    try:
+        await plugin.on_decorating_result(event)
+        await event.send(event.get_result())
+        await plugin.after_message_sent(event)
+        await asyncio.gather(*list(plugin._follow_ups._tasks))
+        assert [
+            event.sent[0].get_plain_text(),
+            *[text for _, text in ctx.sent],
+        ] == expected
+        assert ("本次按标点拆分" not in caplog.text) is use_model
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("segments", [["，", "正文，"], ["，", "；"]])
+async def test_tail_clean_drops_empty_segments(segments: list[str]) -> None:
+    plugin = SmartSegmentationPlugin(
+        FakeContext(json.dumps(segments)),
+        {"min_length": 0, "tail_clean_enabled": True},
+    )
+    result = FakeResult("".join(segments))
+    result.chain.insert(0, At(qq="123"))
+    event = FakeEvent(result)
+    try:
+        await plugin.on_decorating_result(event)
+        if "正文，" in segments:
+            assert result.get_plain_text() == "正文"
+            assert isinstance(result.chain[0], At)
+        else:
+            assert result.chain == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "```text\n" + "x" * 2991 + ";\nend;\n```",
+        "https://example.com/" + "x" * 2980 + ";tail;",
+        "x" * 1498 + "3.14，",
+    ],
+    ids=["fenced-code", "url", "decimal"],
+)
+async def test_tail_clean_preserves_content_at_forced_message_limit(text: str) -> None:
+    ctx = FakeContext("not-json")
+    plugin = SmartSegmentationPlugin(
+        ctx, {"min_length": 2, "delay_max": 0, "tail_clean_enabled": True}
+    )
+    event = FakeEvent(FakeResult(text))
+    try:
+        await plugin.on_decorating_result(event)
+        await event.send(event.get_result())
+        await plugin.after_message_sent(event)
+        await asyncio.gather(*list(plugin._follow_ups._tasks))
+        parts = [event.sent[0].get_plain_text(), *[part for _, part in ctx.sent]]
+        assert "".join(parts) == text.removesuffix("，")
+        assert all(len(part) <= 1500 for part in parts)
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_wrapper", [False, True])
 async def test_plugin_end_to_end_reuses_event_after_reload(
     monkeypatch: pytest.MonkeyPatch,
@@ -457,6 +547,28 @@ async def test_plugin_skips_segmentation_when_stopping(
 
 
 @pytest.mark.asyncio
+async def test_plugin_keeps_whole_reply_when_disabled_during_generation() -> None:
+    ctx = FakeContext()
+    config = {"enabled": True, "min_length": 2}
+    plugin = SmartSegmentationPlugin(ctx, config)
+    source = "今天天气不错我们出去玩吧"
+    event = FakeEvent(FakeResult(source))
+    generate = ctx.llm_generate
+
+    async def disable_during_generate(**kwargs):
+        config["enabled"] = False
+        return await generate(**kwargs)
+
+    ctx.llm_generate = disable_during_generate
+    try:
+        await plugin.on_decorating_result(event)
+        assert event.get_result().get_plain_text() == source
+        assert plugin._follow_ups.pending_id_of(event) == ""
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_plugin_skips_text_already_sent_by_send_message_to_user() -> None:
     """宿主 RespondStage 按这份 extra 抑制重复回复。
 
@@ -477,6 +589,18 @@ async def test_plugin_skips_text_already_sent_by_send_message_to_user() -> None:
     assert ctx.generate_calls == []
     assert plugin._follow_ups.pending_id_of(event) == ""  # type: ignore[attr-defined]
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_split_plain_thinking_tag_is_removed_from_short_reply() -> None:
+    plugin = SmartSegmentationPlugin(FakeContext(), {"min_length": 20})
+    result = FakeResult("")
+    result.chain = [Plain("<thi"), Plain("nk>private-thought</think>你好")]
+    try:
+        await plugin.on_decorating_result(FakeEvent(result))
+        assert result.get_plain_text() == "你好"
+    finally:
+        await plugin.terminate()
 
 
 @pytest.mark.asyncio

@@ -219,15 +219,14 @@ class TestStreamBoundary:
         assert segments == ["第一行\n", "第二行\n"]
         assert rest == "第三行"
 
-    def test_pop_strips_mid_line_spaces_but_keeps_indentation(self) -> None:
-        """行中多余空格可以剥；换行之后的行首缩进是内容（代码块、嵌套列表），不能剥。"""
+    def test_pop_keeps_boundary_spaces_and_indentation(self) -> None:
         segments, rest = pop_stream_segments(
             "  一句。  两句。  ",
             min_chars=2,
             max_chars=90,
         )
-        assert segments == ["  一句。", "两句。"]
-        assert rest == ""
+        assert segments == ["  一句。", "  两句。"]
+        assert rest == "  "
 
     def test_hard_cut_keeps_following_newline(self) -> None:
         """硬切位置上的换行不能丢：find_stream_boundary 只在窗口内找换行，
@@ -241,7 +240,7 @@ class TestStreamBoundary:
         assert rest == "\nnext"
 
     def test_pop_skips_whitespace_only_segments(self) -> None:
-        assert pop_stream_segments("     ", min_chars=1, max_chars=3) == ([], "")
+        assert pop_stream_segments("     ", min_chars=1, max_chars=3) == ([], "  ")
         assert pop_stream_segments("\n\n\nhello", min_chars=3, max_chars=90) == (
             [],
             "hello",
@@ -258,14 +257,10 @@ class TestStreamBoundary:
         assert segments == []
         assert rest == "好的" + "\n" * 20 + "后面"  # 等待中不能丢内容
 
-    def test_weak_boundary_before_min_no_cut(self) -> None:
-        assert find_stream_boundary("你，好", min_chars=5, max_chars=90) is None
-
-    def test_weak_boundary_at_min_is_accepted(self) -> None:
-        """弱边界与强句读符/换行共用同一道 min 闸门：逗号恰好落在 min_chars-1
-        处时必须被接受，否则会退化成硬切。"""
-        text = "x" * 17 + "，" + "y" * 80
-        assert find_stream_boundary(text, min_chars=18, max_chars=90) == 18
+    @pytest.mark.parametrize("prefix_length, expected", [(16, 90), (17, 18)])
+    def test_weak_boundary_respects_min(self, prefix_length, expected) -> None:
+        text = "x" * prefix_length + "，" + "y" * 80
+        assert find_stream_boundary(text, min_chars=18, max_chars=90) == expected
 
     def test_hard_cut_at_max_without_boundary(self) -> None:
         assert find_stream_boundary("a" * 100, min_chars=10, max_chars=50) == 50

@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import At, Image, Plain, Reply
-from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
+from astrbot_plugin_smart_segmentation.settings import (
+    SegmentationSettings,
+    load_settings,
+)
 from astrbot_plugin_smart_segmentation.streaming.wrapper import (
     STREAMING_SEGMENT_CHAIN_TYPE,
     decorate_streaming_result,
@@ -23,6 +26,158 @@ def _collected(items: list[MessageChain]) -> list[tuple[str, str]]:
             elif isinstance(comp, At):
                 out.append(("at", str(getattr(comp, "qq", ""))))
     return out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("chunk_size", [1, 100])
+async def test_stream_tail_clean_handles_boundaries_and_final_flush(
+    enabled: bool, chunk_size: int
+) -> None:
+    text = "第一句，\n第二句；\n最后一句；"
+
+    async def gen():
+        yield MessageChain([At(qq="1")])
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = load_settings({"tail_clean_enabled": enabled, "streaming_min_chars": 2})
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert _collected(collected) == [
+        ("at", "1"),
+        ("plain", "第一句\n" if enabled else "第一句，\n"),
+        ("plain", "第二句\n" if enabled else "第二句；\n"),
+        ("plain", "最后一句" if enabled else "最后一句；"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 100])
+@pytest.mark.parametrize(
+    "marks,text,expected",
+    [
+        (["？", "！"], "第一句，\n末尾？！", "第一句，\n末尾"),
+        ([], "第一句。\n最后，", "第一句。\n最后，"),
+        (["-"], "x" * 39 + "-", "x" * 39),
+        (
+            ["？", "?", ";"],
+            "`a?;`，\nhttps://example.com/q?;\n末尾？",
+            "`a?;`，\nhttps://example.com/q?;\n末尾",
+        ),
+    ],
+)
+async def test_custom_tail_marks_apply_to_stream(marks, text, expected, chunk_size):
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = load_settings(
+        {
+            "tail_clean_enabled": True,
+            "tail_clean_marks": marks,
+            "streaming_min_chars": 2,
+            "streaming_max_chars": 40,
+        }
+    )
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert "".join(part for _, part in _collected(collected)) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", [".", ":", "：", "1,"])
+@pytest.mark.parametrize("chunk_size", [1, 100])
+async def test_stream_cleans_final_tail_at_length_limit(suffix, chunk_size) -> None:
+    text = "x" * (40 - len(suffix)) + suffix
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = SegmentationSettings(
+        tail_clean_enabled=True, streaming_min_chars=6, streaming_max_chars=40
+    )
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert "".join(part for _, part in _collected(collected)) == text.rstrip(".,:：")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flush_punctuation", [False, True])
+async def test_stream_tail_clean_keeps_at_for_next_visible_segment(
+    flush_punctuation: bool,
+) -> None:
+    async def gen():
+        yield MessageChain([At(qq="1"), Plain("，" if flush_punctuation else "。")])
+        if flush_punctuation:
+            yield MessageChain([Plain("原始类型。")], type="reasoning")
+        yield MessageChain([Plain("正文。")])
+
+    settings = load_settings({"tail_clean_enabled": True, "streaming_min_chars": 1})
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    if flush_punctuation:
+        assert collected.pop(0).type == "reasoning"
+    assert _collected(collected) == [("at", "1"), ("plain", "正文")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text",
+    [
+        "```text\n" + "x" * 71 + ";\nend;\n```\n",
+        "https://example.com/" + "x" * 60 + ";tail;\n",
+        "x" * 38 + "3.14\n",
+        "x" * 38 + "1,234\n",
+    ],
+    ids=["fenced-code", "url", "decimal", "thousands"],
+)
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_tail_clean_preserves_content_across_hard_cuts(
+    text: str, chunk_size: int
+) -> None:
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = SegmentationSettings(
+        tail_clean_enabled=True, streaming_min_chars=6, streaming_max_chars=40
+    )
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert "".join(part for _, part in _collected(collected)) == text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 40, 200])
+async def test_stream_tail_clean_resumes_after_long_fenced_code(
+    chunk_size: int,
+) -> None:
+    code = "```text\n" + "x;\n" * 40 + "```\n"
+    text = code + "代码之后的正文，\n"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = SegmentationSettings(
+        tail_clean_enabled=True, streaming_min_chars=6, streaming_max_chars=40
+    )
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert (
+        "".join(part for _, part in _collected(collected)) == code + "代码之后的正文\n"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 200])
+async def test_stream_tail_clean_preserves_tilde_fence(chunk_size) -> None:
+    code = "a" * 17 + "\n~~~python\nprint('x');\n~~~\n"
+    text = code + "说明，"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    settings = SegmentationSettings(tail_clean_enabled=True)
+    collected = [chain async for chain in stream_realtime_segments(gen(), settings)]
+    assert "".join(part for _, part in _collected(collected)) == code + "说明"
 
 
 @pytest.mark.asyncio
@@ -398,6 +553,7 @@ async def test_stream_flushes_buffer_before_typed_chain() -> None:
 class _FakeEvent:
     def __init__(self) -> None:
         self.extra: dict = {}
+        self.plugins_name = None
         self.platform_meta = SimpleNamespace(support_streaming_message=True)
 
     def get_extra(self, key: str, default=None):

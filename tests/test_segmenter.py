@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 from astrbot_plugin_smart_segmentation.segmenter import OutboundSegmenter
-from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
+from astrbot_plugin_smart_segmentation.settings import (
+    SegmentationSettings,
+    load_settings,
+)
 
 
 class FakeContext:
     def __init__(
-        self, *, provider_id: str = "p1", completion: str = '["你好", "世界"]'
+        self, *, provider_id: str = "p1", completion: str | None = '["你好", "世界"]'
     ) -> None:
         self._provider_id = provider_id
         self._completion = completion
@@ -101,6 +105,61 @@ async def test_segment_accepts_comma_kept_at_boundary() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_model_can_omit_boundary_comma_only_when_tail_clean_enabled(
+    enabled: bool, caplog
+) -> None:
+    parts = ["材料已备齐，装配也已完成", "接下来开始测试"]
+    text = "材料已备齐，装配也已完成，接下来开始测试"
+    context = FakeContext(completion=json.dumps(parts))
+    result = await OutboundSegmenter(context).segment(
+        SimpleNamespace(unified_msg_origin="sess:1"),
+        text,
+        SegmentationSettings(min_length=2, tail_clean_enabled=enabled),
+    )
+    assert result == (parts if enabled else [])
+    assert ("分段结果与原文不一致" in caplog.text) is not enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marks,accepted", [(["？"], True), (["，"], False), ([], False)]
+)
+async def test_custom_tail_marks_control_model_omission(marks, accepted, caplog):
+    context = FakeContext(completion='["材料齐了", "开始装配，"]')
+    await OutboundSegmenter(context).segment(
+        SimpleNamespace(unified_msg_origin="sess:1"),
+        "材料齐了？开始装配，",
+        load_settings(
+            {"min_length": 2, "tail_clean_enabled": True, "tail_clean_marks": marks}
+        ),
+    )
+    assert ("分段结果与原文不一致" not in caplog.text) is accepted
+    if accepted:
+        assert "「？」" in context.generate_calls[0]["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source,parts",
+    [
+        ("你好，朋友。再见", ["你好朋友", "再见"]),
+        ("数值3.14。再见", ["数值3.", "14。再见"]),
+        ("看https://example.com/a;b。再见", ["看https://example.com/a", "b。再见"]),
+    ],
+    ids=["internal-comma", "decimal-boundary", "url-boundary"],
+)
+async def test_tail_clean_still_rejects_model_content_changes(source, parts, caplog):
+    context = FakeContext(completion=json.dumps(parts))
+    await OutboundSegmenter(context).segment(
+        SimpleNamespace(unified_msg_origin="sess:1"),
+        source,
+        SegmentationSettings(min_length=2, tail_clean_enabled=True),
+    )
+    assert "分段结果与原文不一致" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_segment_fallback_on_bad_json() -> None:
     ctx = FakeContext(completion="not-json")
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
@@ -164,9 +223,10 @@ async def test_segment_llm_exception_falls_back(caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_segment_empty_completion_skips() -> None:
+@pytest.mark.parametrize("completion", ["", None])
+async def test_segment_empty_completion_skips(completion) -> None:
     """模型返回空内容时不分段（而不是拿原文去本地切）。"""
-    ctx = FakeContext(completion="")
+    ctx = FakeContext(completion=completion)
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)
@@ -199,19 +259,14 @@ async def test_segment_skips_model_when_stopping() -> None:
     assert ctx.generate_calls == []
 
 
-class SyncProviderContext(FakeContext):
-    def get_current_chat_provider_id(self, umo: str | None = None) -> str:
-        return self._provider_id
+class UnavailableProviderContext(FakeContext):
+    async def get_current_chat_provider_id(self, umo: str | None = None) -> str:
+        raise ValueError("No available chat provider")
 
 
 @pytest.mark.asyncio
-async def test_sync_provider_id_degrades_to_local_fallback() -> None:
-    """4.16-4.29 的 get_current_chat_provider_id 都是 async def。
-
-    同步返回模型 ID 的实现不合法：await 抛 TypeError 后按约定记 debug、返回空串，
-    本次走本地规则，不能把异常带出 hook。
-    """
-    ctx = SyncProviderContext()
+async def test_provider_lookup_failure_uses_local_fallback() -> None:
+    ctx = UnavailableProviderContext()
     segmenter = OutboundSegmenter(ctx)  # type: ignore[arg-type]
     event = SimpleNamespace(unified_msg_origin="sess:1")
     settings = SegmentationSettings(min_length=2, max_segments=5, timeout_seconds=5)

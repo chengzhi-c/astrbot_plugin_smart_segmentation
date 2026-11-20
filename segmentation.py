@@ -6,7 +6,7 @@ import re
 from itertools import pairwise
 from typing import Any
 
-from .bounds import DELAY_JITTER_SECONDS
+from .bounds import DEFAULT_TAIL_CLEAN_MARKS, DELAY_JITTER_SECONDS, MAX_SEGMENT_CHARS
 
 # 标签的属性段必须限字符集与长度：[^>]* 能一路吃到下一个 ">"（跨行、跨整段
 # 正文），把可见内容当属性删掉。
@@ -209,6 +209,7 @@ BRACKET_PAIRS: tuple[tuple[str, str], ...] = (
 )
 STRONG_BOUNDARY_MARKS = "。？！~…!?"
 WEAK_BOUNDARY_MARKS = "，,；;、 "
+_NUMBER_RE = re.compile(r"\d+(?:[.,:：]\d+)+")
 SENTENCE_BOUNDARY_RE = re.compile(
     rf"[^{re.escape(STRONG_BOUNDARY_MARKS)}\n]+[{re.escape(STRONG_BOUNDARY_MARKS)}]*",
 )
@@ -217,6 +218,26 @@ SENTENCE_BOUNDARY_RE = re.compile(
 def has_visible_text(text: str) -> bool:
     """str.strip() 会保留零宽格式字符，它们单独成段时没有可见正文。"""
     return any(char.isprintable() and not char.isspace() for char in text)
+
+
+def clean_segment_tail(
+    text: str,
+    marks: str = DEFAULT_TAIL_CLEAN_MARKS,
+    *,
+    protected_prefix: int | None = None,
+) -> str:
+    body = text.rstrip()
+    cleaned = body.rstrip(marks)
+    if cleaned == body:
+        return text
+    # 清理不能越过最后一个代码或链接的边界，例如 URL 的分号后紧跟中文逗号。
+    if protected_prefix is None:
+        protected_prefix = max(
+            (end for _, end in mask_uncuttable_spans(body, open_tails=True)),
+            default=0,
+        )
+    # 流式平台会拼接各段，换行和缩进仍须保留。
+    return body[: max(len(cleaned), protected_prefix)] + text[len(body) :]
 
 
 def _strip_single_trailing_period(text: str) -> str:
@@ -598,12 +619,6 @@ STYLE_GUIDES = {
 }
 
 
-# 普通消息段的字符上限。平台对单条消息的上限差异很大（Discord 超过 2000
-# 字直接静默截断），把整条尾巴并进一段会让插件自己产出一条超限消息——那正是用户
-# 开分段要避免的。能装进上限的链接和代码块保持完整。
-_MAX_SEGMENT_CHARS = 1500
-
-
 def cap_segments(
     segments: list[str],
     *,
@@ -626,7 +641,7 @@ def cap_segments(
     group_len = 0
     for segment in segments[max_segments - 1 :]:
         extra = len(segment) + (len(joiner) if group else 0)
-        if group and group_len + extra > _MAX_SEGMENT_CHARS:
+        if group and group_len + extra > MAX_SEGMENT_CHARS:
             tails.append(joiner.join(group))
             group = [joiner + segment]
             group_len = extra
@@ -642,7 +657,7 @@ def split_oversized_segments(segments: list[str]) -> list[str]:
     """硬切超长消息；能装进上限的链接、代码等原子保持完整。"""
     result: list[str] = []
     for segment in segments:
-        if len(segment) <= _MAX_SEGMENT_CHARS:
+        if len(segment) <= MAX_SEGMENT_CHARS:
             result.append(segment)
             continue
 
@@ -650,8 +665,8 @@ def split_oversized_segments(segments: list[str]) -> list[str]:
         escape = _pick_escape_char([segment])
         if escape is None:
             result.extend(
-                segment[start : start + _MAX_SEGMENT_CHARS]
-                for start in range(0, len(segment), _MAX_SEGMENT_CHARS)
+                segment[start : start + MAX_SEGMENT_CHARS]
+                for start in range(0, len(segment), MAX_SEGMENT_CHARS)
             )
             continue
 
@@ -660,7 +675,7 @@ def split_oversized_segments(segments: list[str]) -> list[str]:
         # 硬切保住长度上限与全部正文；其余原子仍按完整占位符保护。
         for match in reversed(list(_URL_MASK_RE.finditer(masked))):
             atom_index = int(match.group(1))
-            if len(atoms[atom_index]) > _MAX_SEGMENT_CHARS:
+            if len(atoms[atom_index]) > MAX_SEGMENT_CHARS:
                 masked = (
                     masked[: match.start()] + atoms[atom_index] + masked[match.end() :]
                 )
@@ -691,10 +706,10 @@ def split_oversized_segments(segments: list[str]) -> list[str]:
         def append_plain(text: str, chunk: list[str] = chunk) -> None:
             nonlocal chunk_length
             while text:
-                available = _MAX_SEGMENT_CHARS - chunk_length
+                available = MAX_SEGMENT_CHARS - chunk_length
                 if available == 0:
                     flush_chunk()
-                    available = _MAX_SEGMENT_CHARS
+                    available = MAX_SEGMENT_CHARS
                 part = text[:available]
                 chunk.append(part)
                 chunk_length += len(part)
@@ -706,7 +721,7 @@ def split_oversized_segments(segments: list[str]) -> list[str]:
             token = match.group(0)
             atom_match = _URL_MASK_RE.fullmatch(token)
             token_length = len(atoms[int(atom_match.group(1))]) if atom_match else 1
-            if chunk_length and chunk_length + token_length > _MAX_SEGMENT_CHARS:
+            if chunk_length and chunk_length + token_length > MAX_SEGMENT_CHARS:
                 flush_chunk()
             chunk.append(token)
             chunk_length += token_length
@@ -915,7 +930,13 @@ def _stage_sentences(segments: list[str]) -> list[str]:
     return result
 
 
-def split_text_locally(text: str, *, max_segments: int) -> list[str]:
+def split_text_locally(
+    text: str,
+    *,
+    max_segments: int,
+    split_long: bool = True,
+    strip_trailing_period: bool = True,
+) -> list[str]:
     cleaned = strip_thinking_content(text).strip()
     if not cleaned:
         return []
@@ -925,27 +946,38 @@ def split_text_locally(text: str, *, max_segments: int) -> list[str]:
     atoms: list[str] = []
     escape = _pick_escape_char([cleaned])
     if escape is None:
-        return split_oversized_segments([cleaned])
+        return split_oversized_segments([cleaned]) if split_long else [cleaned]
     masked = _mask_atoms(_escape_placeholder_chars(cleaned, escape), atoms)
     pipeline = cap_segments(
         _stage_sentences(_stage_lines(_stage_bracket([masked]))),
         max_segments=max_segments,
         joiner="\n",
     )
+    if strip_trailing_period:
+        pipeline = _strip_trailing_periods(pipeline)
     restored = [
         _unescape_placeholder_chars(_unmask_atoms(segment, atoms), escape)
-        for segment in _strip_trailing_periods(pipeline)
+        for segment in pipeline
     ]
-    return split_oversized_segments(restored)
+    return split_oversized_segments(restored) if split_long else restored
 
 
-def same_content(segments: list[str], text: str) -> bool:
-    """分段只能切不能改，允许每段末尾省略一个「。」。
+def same_content(
+    segments: list[str],
+    text: str,
+    *,
+    tail_clean_enabled: bool = False,
+    tail_clean_marks: str = DEFAULT_TAIL_CLEAN_MARKS,
+) -> bool:
+    """只允许在分段边界省略配置准许清理的标点。
 
-    模型提示词要求去掉每条消息末尾的句号；普通文本允许空白差异，代码的内容和
-    空白必须完全一致，句中句号仍是正文。
+    普通文本允许空白差异，代码的内容和空白必须完全一致。
+    未启用自定义清理时，沿用省略单个句末「。」的规则。
     """
-    for pattern in (_FENCE_RE, _INLINE_CODE_RE):
+    patterns = (_FENCE_RE, _INLINE_CODE_RE, _URL_RE)
+    if tail_clean_enabled:
+        patterns += (_NUMBER_RE,)
+    for pattern in patterns:
         if [
             match.group(0)
             for segment in segments
@@ -970,7 +1002,14 @@ def same_content(segments: list[str], text: str) -> bool:
             if index + 1 < len(segments)
             else None
         )
-        if cursor < len(source) and source[cursor] == "。" and next_char != "。":
+        if tail_clean_enabled:
+            while (
+                cursor < len(source)
+                and source[cursor] in tail_clean_marks
+                and source[cursor] != next_char
+            ):
+                cursor += 1
+        elif cursor < len(source) and source[cursor] == "。" and next_char != "。":
             cursor += 1
     return cursor == len(source)
 
@@ -994,15 +1033,30 @@ def normalize_segments(segments: Any, *, max_segments: int) -> list[str]:
     return cap_segments(normalized_segments, max_segments=max_segments, joiner="\n")
 
 
-def build_segmentation_prompt(text: str, style: str, max_segments: int) -> str:
+def build_segmentation_prompt(
+    text: str,
+    style: str,
+    max_segments: int,
+    *,
+    tail_clean_enabled: bool = False,
+    tail_clean_marks: str = DEFAULT_TAIL_CLEAN_MARKS,
+) -> str:
     style_guide = STYLE_GUIDES[style]
+    if tail_clean_enabled:
+        punctuation_rule = (
+            f"只可以省略每条消息末尾的这些符号「{tail_clean_marks}」；其他标点必须保留；"
+            if tail_clean_marks
+            else "所有标点必须原样保留；"
+        ) + "句中的标点、数字、代码和链接必须原样保留"
+    else:
+        punctuation_rule = "只去掉每条消息末尾的句号「。」；原文中的逗号、分号、感叹号、问号、省略号、波浪号等标点必须保留"
     return f"""你正在模拟一个人用手机聊天。下面是 ta 想说的内容，请把它分成几条消息，就像真人会怎么一条一条发出来那样。
 
 {style_guide}
 
 规则：
 - 不要改写原意，不要补充新信息
-- 只去掉每条消息末尾的句号「。」；原文中的逗号、分号、感叹号、问号、省略号、波浪号等标点必须保留
+- {punctuation_rule}
 - 不要每个逗号都拆开，相关的内容放在一条里
 - 消息长短可以不均匀
 - 不要在单个数组元素内部使用换行；如果你想换行，就拆成数组中的下一项
@@ -1021,6 +1075,8 @@ def parse_segments_from_model_output(
     raw_text: str,
     *,
     max_segments: int,
+    split_long: bool = True,
+    strip_trailing_period: bool = True,
 ) -> list[str]:
     try:
         json_text = extract_json_array_text(raw_text)
@@ -1033,7 +1089,7 @@ def parse_segments_from_model_output(
     atoms: list[str] = []
     escape = _pick_escape_char(normalized)
     if escape is None:
-        return split_oversized_segments(normalized)
+        return split_oversized_segments(normalized) if split_long else normalized
     # 模型有时会把围栏/表格逐行放进数组；先拼回一份带行分隔的文本，才能跨元素
     # 识别这些不可拆原子。私有 marker 保留数组边界，括号配平时只移除人工换行。
     marker = _pick_segment_boundary_marker(normalized, escape)
@@ -1053,14 +1109,16 @@ def parse_segments_from_model_output(
         atoms[:] = [atom.replace(marker, "") for atom in atoms]
         masked_segments = masked_combined.split(f"{marker}\n")
     balanced = merge_segments_balancing_brackets(masked_segments)
-    pipeline = _stage_lines(_stage_bracket(balanced))
+    pipeline = cap_segments(
+        _stage_lines(_stage_bracket(balanced)), max_segments=max_segments, joiner="\n"
+    )
+    if strip_trailing_period:
+        pipeline = _strip_trailing_periods(pipeline)
     restored = [
         _unescape_placeholder_chars(_unmask_atoms(segment, atoms), escape)
-        for segment in _strip_trailing_periods(
-            cap_segments(pipeline, max_segments=max_segments, joiner="\n"),
-        )
+        for segment in pipeline
     ]
-    return split_oversized_segments(restored)
+    return split_oversized_segments(restored) if split_long else restored
 
 
 def calculate_send_delay(

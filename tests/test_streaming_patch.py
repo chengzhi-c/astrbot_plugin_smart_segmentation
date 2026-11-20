@@ -76,8 +76,7 @@ def test_takeover_then_third_party_restores_our_patch_still_uninstalls_cleanly()
         ours = ResultDecorateStage.process
         assert ours is not original
 
-        # 第三方接管：保存我们的 patched 再替换。sync 走进接管分支，
-        # 旧实现会在这里把 _original 清成 None。
+        # 第三方接管期间仍须保留原函数，便于卸载时恢复。
         ResultDecorateStage.process = foreign
         manager.sync(_settings())
         assert manager._installed is False

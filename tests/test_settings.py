@@ -14,6 +14,18 @@ from astrbot_plugin_smart_segmentation.settings import load_settings
 
 
 class TestLoadSettings:
+    def test_tail_clean_toggle_tracks_config_changes(self) -> None:
+        config = {}
+        assert load_settings(config).tail_clean_enabled is False
+        config["tail_clean_enabled"] = True
+        assert load_settings(config).tail_clean_enabled is True
+        config["tail_clean_enabled"] = False
+        assert load_settings(config).tail_clean_enabled is False
+        config["tail_clean_marks"] = ["？", "！"]
+        assert load_settings(config).tail_clean_marks == "？！"
+        config["tail_clean_marks"] = []
+        assert load_settings(config).tail_clean_marks == ""
+
     def test_disabled_returns_none(self) -> None:
         assert load_settings({"enabled": False}) is None
 

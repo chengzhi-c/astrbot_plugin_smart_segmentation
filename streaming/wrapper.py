@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncGenerator, Sequence
 from typing import Any
 
@@ -9,11 +10,14 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, MessageEventResult
 from astrbot.api.message_components import At, Plain, Reply
 
+from ..bounds import PLUGIN_NAME
 from ..errors import brief_exception
 from ..segmentation import (
+    _FENCE_RE,
     STRONG_BOUNDARY_MARKS,
     WEAK_BOUNDARY_MARKS,
     _ThinkingFilter,
+    clean_segment_tail,
     has_visible_text,
     mask_uncuttable_spans,
 )
@@ -75,6 +79,10 @@ def find_stream_boundary(
     # 等长遮罩保留原文索引；未闭合单元也遮到窗口末尾。规则与本地分段同源，
     # 否则同一段文本在两条路径上会切出不同边界。
     spans = mask_uncuttable_spans(head, open_tails=True)
+    # 行首的 ~ 可能还在组成围栏，收齐前不能当作句尾波浪号发送。
+    pending_fence = re.search(r"(?:^|\n) {0,3}(~{1,2})$", head)
+    if pending_fence:
+        spans.append(pending_fence.span(1))
     masked = list(head)
     for start, end in spans:
         masked[start:end] = '"' * (end - start)
@@ -120,6 +128,8 @@ def find_stream_boundary(
         for start, end in spans:
             if start < max_chars <= end and len(text[:start].strip()) >= min_chars:
                 return start
+        if pending_fence and len(text) == len(head):
+            return None
         # shortcut: 单元本身超长或其前缀不足 min 时仍在 max 硬切；宁可降级渲染，
         # 也不为等待 URL 结束/闭围栏而无限缓冲，且边界始终为正，保证 pop 前进。
         shifted = _shift_boundary_off_grapheme(text, max_chars)
@@ -139,7 +149,7 @@ def pop_stream_segments(
     # 块边界可能把 "\r\n" 截成两块：末尾孤立的 "\r" 留到下一次调用再归一化，
     # 就地转成 "\n" 会让 "abc\r" + "\ndef" 多出一个空行，切法随 chunk 大小漂移。
     # flush 路径没有"下一次"，由 _make_flush_chain 归一化。
-    raw = str(buffer or "")
+    raw = buffer
     dangling_cr = raw.endswith("\r")
     if dangling_cr:
         raw = raw[:-1]
@@ -154,16 +164,8 @@ def pop_stream_segments(
         )
         if boundary is None:
             break
-        # 只去尾部空格/制表符：换行与段首缩进都是内容（平台无分隔符拼接各段，
-        # 代码块和嵌套列表靠行首空格），消息边缘多一个不可见空格没有代价。
-        segment = text[:boundary].rstrip(" \t")
-        # 只剥空格/制表符：换行符是内容（平台无分隔符拼接各段），硬切位置上的
-        # 换行不能丢，否则 markdown 列表被黏成一行、结果还随 chunk 大小漂移。
-        rest = text[boundary:]
-        # 边界落在行尾时，下一行开头的缩进也是内容（代码块、嵌套列表）
-        if not segment.endswith("\n"):
-            rest = rest.lstrip(" \t")
-        text = rest
+        # 平台会无分隔符拼接各段，边界空白也是单词分隔符和缩进。
+        segment, text = text[:boundary], text[boundary:]
         if has_visible_text(segment):
             segments.append(segment)
 
@@ -186,7 +188,7 @@ def _make_flush_chain(
     只剥尾部空格/制表符：换行符与行首缩进都是内容（平台无分隔符拼接各段）。
     """
     # 只去尾部空格：剩下的这段可能从行首开始，行首缩进是内容（代码块、嵌套列表）
-    text = str(buffer or "").replace("\r\n", "\n").replace("\r", "\n").rstrip(" \t")
+    text = buffer.replace("\r\n", "\n").replace("\r", "\n").rstrip(" \t")
     return make_stream_segment_chain(text, prefix) if has_visible_text(text) else None
 
 
@@ -195,6 +197,7 @@ async def stream_realtime_segments(
     settings: SegmentationSettings,
 ) -> AsyncGenerator[MessageChain, None]:
     buffer = ""
+    tail_context = ""
     decorations: list[Any] = []
     thinking_filter = _ThinkingFilter()
 
@@ -203,9 +206,37 @@ async def stream_realtime_segments(
         decorations.clear()
         return carried
 
+    def clean_tail(text: str, *, final: bool = False) -> str:
+        nonlocal tail_context
+        combined = tail_context + text
+        spans = mask_uncuttable_spans(combined, open_tails=True)
+        protected_prefix = max((end - len(tail_context) for _, end in spans), default=0)
+        # 长代码或 URL 被强制截断后，下一段仍属于同一受保护单元。
+        tail_context = (
+            combined[spans[-1][0] :] if spans and spans[-1][1] == len(combined) else ""
+        )
+        # 已发完的代码行不影响后续围栏识别，只保留开围栏和当前行。
+        if "\n" in tail_context and _FENCE_RE.match(tail_context):
+            opening, _, rest = tail_context.partition("\n")
+            tail_context = opening + "\n" + rest.rsplit("\n", 1)[-1]
+        # 下一块尚未到达时，数字后的逗号可能是千位分隔符。
+        if not final and len(text) >= 2 and text[-2].isdigit() and text[-1] in ".,":
+            return text
+        # 长度硬切处的点号可能是小数点，只清理自然断句和最终收尾。
+        if final or (
+            text and text[-1] in STRONG_BOUNDARY_MARKS + WEAK_BOUNDARY_MARKS + "\n"
+        ):
+            return clean_segment_tail(
+                text, settings.tail_clean_marks, protected_prefix=protected_prefix
+            )
+        return text
+
     def flush() -> MessageChain | None:
-        nonlocal buffer
+        nonlocal buffer, tail_context
         pending, buffer = buffer, ""
+        if settings.tail_clean_enabled:
+            pending = clean_tail(pending, final=True)
+        tail_context = ""
         if not has_visible_text(pending):
             return None
         return _make_flush_chain(pending, take_decorations())
@@ -220,6 +251,21 @@ async def stream_realtime_segments(
             min_chars=settings.streaming_min_chars,
             max_chars=settings.streaming_max_chars,
         )
+        if settings.tail_clean_enabled:
+            # 块尾符号需要下一块或 EOF 才能区分数字延续与真正收尾。
+            if (
+                segments
+                and not buffer
+                and segments[-1][-1] in settings.tail_clean_marks
+                and (
+                    segments[-1][-1] in ".,:："
+                    or segments[-1][-1]
+                    not in STRONG_BOUNDARY_MARKS + WEAK_BOUNDARY_MARKS
+                )
+            ):
+                buffer = segments.pop()
+            segments = [clean_tail(segment) for segment in segments]
+            segments = [segment for segment in segments if has_visible_text(segment)]
         return segments
 
     try:
@@ -288,6 +334,9 @@ def decorate_streaming_result(
 ) -> None:
     if not settings.streaming_compat_enabled:
         return
+    plugins = event.plugins_name
+    if plugins is not None and plugins != ["*"] and PLUGIN_NAME not in plugins:
+        return
     # 平台不支持流式消息时，宿主会把每条链重新拼成一个 buffer 再按标点切分
     # （aiocqhttp 默认如此）：本插件实时分段的边界到不了用户，只多一层缓冲延迟。
     if not event.platform_meta.support_streaming_message:
@@ -297,7 +346,7 @@ def decorate_streaming_result(
     if event.get_extra(STREAMING_WRAPPED_KEY, False):
         return
 
-    stream = getattr(result, "async_stream", None)
+    stream = result.async_stream
     if stream is None:
         return
 

@@ -11,13 +11,9 @@ from astrbot_plugin_smart_segmentation.segmentation import (
 GOLDEN_DIR = Path(__file__).parent / "golden"
 
 
-def _load_cases() -> list[dict]:
-    path = GOLDEN_DIR / "local_split_cases.json"
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def test_local_split_goldens() -> None:
-    for case in _load_cases():
+    path = GOLDEN_DIR / "local_split_cases.json"
+    for case in json.loads(path.read_text(encoding="utf-8")):
         got = split_text_locally(case["text"], max_segments=case.get("max_segments", 5))
         assert got == case["expected"], case.get("name", case["text"])
 

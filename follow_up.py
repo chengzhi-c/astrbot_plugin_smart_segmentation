@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -20,7 +21,13 @@ from .errors import brief_exception, is_caller_cancelled
 from .segmentation import calculate_send_delay, split_oversized_segments
 from .settings import SegmentationSettings
 
+try:
+    from astrbot.core.utils.active_event_registry import active_event_registry
+except ImportError:
+    active_event_registry = None
+
 _PENDING_EXTRA_KEY = "smart_segmentation_pending_id"
+_PENDING_RECORD_EXTRA_KEY = "smart_segmentation_pending_record"
 _APPLIED_EXTRA_KEY = "smart_segmentation_applied_result"
 _FIRST_SEND_DISPATCHER_EXTRA_KEY = "smart_segmentation_first_send_dispatcher"
 _FIRST_PLAIN_ATTR = "_smart_segmentation_first_plain"
@@ -36,6 +43,8 @@ class PendingFollowUp:
     expires_at: float
     first_send_delivered: bool = False
     first_send_failed: bool = False
+    first_send_in_progress: bool = False
+    event: Any = None
 
 
 class FollowUpDispatcher:
@@ -49,9 +58,16 @@ class FollowUpDispatcher:
         self._is_enabled = is_enabled
         self._pending: dict[str, PendingFollowUp] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
-        self._session_tails: dict[str, asyncio.Task[Any]] = {}
+        # 在途任务持有锁；最后一个任务结束后会话锁自动释放。
+        self._session_locks: WeakValueDictionary[str, asyncio.Lock] = (
+            WeakValueDictionary()
+        )
         self._guards: dict[str, int] = {}
         self._stopping = False
+        # 旧宿主没有后台任务注册接口，保留原来的插件内任务管理。
+        self._register_background_task = getattr(
+            active_event_registry, "register_background_task", None
+        )
 
     def mark_stopping(self) -> None:
         self._stopping = True
@@ -73,7 +89,7 @@ class FollowUpDispatcher:
                     len(pending),
                 )
         self._tasks.clear()
-        self._session_tails.clear()
+        self._session_locks.clear()
         self._pending.clear()
         self._guards.clear()
 
@@ -85,6 +101,7 @@ class FollowUpDispatcher:
 
     def mark_pending(self, event: Any, pending_id: str, result: Any) -> None:
         event.set_extra(_PENDING_EXTRA_KEY, pending_id)
+        event.set_extra(_PENDING_RECORD_EXTRA_KEY, self._pending[pending_id])
         # 直接存对象、按身份判定：存 id() 会在 result 释放后地址被同一 event 上
         # 的新 result 复用时，把新回复误判为已处理而静默跳过分段（agent 多步
         # 循环每步都新建 MessageEventResult）。
@@ -108,13 +125,28 @@ class FollowUpDispatcher:
         async def tracked_send(message: Any) -> Any:
             dispatcher = event.get_extra(_FIRST_SEND_DISPATCHER_EXTRA_KEY)
             pending_id = dispatcher.pending_id_of(event)
+            # TTS/转图可能耗时超过 TTL；首段真正开始发送时重新接续尚未发送的记录。
+            record = event.get_extra(_PENDING_RECORD_EXTRA_KEY)
+            if (
+                not dispatcher._stopping
+                and pending_id not in dispatcher._pending
+                and record is not None
+                and not (record.first_send_delivered or record.first_send_failed)
+            ):
+                dispatcher._pending[pending_id] = record
             pending = (
                 dispatcher._pending.get(pending_id)
                 if pending_id
                 and dispatcher.is_first_segment_send(event, pending_id, message)
                 else None
             )
-            result = await original_send(message)
+            if pending is not None:
+                pending.first_send_in_progress = True
+            try:
+                result = await original_send(message)
+            finally:
+                if pending is not None:
+                    pending.first_send_in_progress = False
             if pending is not None:
                 if result is False:
                     pending.first_send_failed = True
@@ -155,6 +187,7 @@ class FollowUpDispatcher:
 
     def clear_extras(self, event: Any) -> None:
         event.set_extra(_PENDING_EXTRA_KEY, "")
+        event.set_extra(_PENDING_RECORD_EXTRA_KEY, None)
         event.set_extra(_APPLIED_EXTRA_KEY, "")
         # 保留包装标记；同一事件复用包装，热重载时只更新 dispatcher 归属。
 
@@ -164,6 +197,7 @@ class FollowUpDispatcher:
         session: str,
         segments: list[str],
         settings: SegmentationSettings,
+        event: Any = None,
     ) -> str:
         self.reap_expired()
         pending_id = uuid4().hex
@@ -174,6 +208,7 @@ class FollowUpDispatcher:
             delay_per_char=settings.delay_per_char,
             delay_max=settings.delay_max,
             expires_at=time.monotonic() + PENDING_FOLLOW_UP_TTL_SECONDS,
+            event=event,
         )
         return pending_id
 
@@ -189,33 +224,31 @@ class FollowUpDispatcher:
     def schedule(self, pending: PendingFollowUp, *, start_index: int = 1) -> None:
         if self._stopping:
             return
-        # 同会话的补发必须串行：两个 burst 交错发送会把消息顺序打乱。默认 agent
-        # runner 用会话锁把整轮运行串行化，第三方 runner（dify/coze/…）没有，
-        # 这里自己保证，不依赖 AstrBot 内部的锁。
         self._track(
-            self._run(
-                pending,
-                self._session_tails.get(pending.session),
-                start_index=start_index,
-            ),
+            lambda: self._run(pending, start_index=start_index),
             pending.session,
+            pending.event,
         )
-        # 注意：上一轮结束到本轮被唤醒之间有一个迭代宽的守卫空窗（协程返回即
-        # 释放守卫，下一任务的 __wakeup 要等下一个事件循环迭代）。落窗内的新
-        # 消息会被正常分段而不是整条发送；补发顺序仍由 _session_tails 保证。
 
-    def _track(self, coro: Any, session: str) -> None:
-        """登记补发任务并接进同会话串行链。"""
-        task = asyncio.create_task(coro)
-        self._session_tails[session] = task
+    def _track(
+        self,
+        send: Callable[[], Coroutine[Any, Any, None]],
+        session: str,
+        event: Any = None,
+    ) -> None:
+        """同会话串行发送；取消排队任务不影响其他轮次。"""
+        lock = self._session_locks.setdefault(session, asyncio.Lock())
 
-        def _forget(finished: asyncio.Task[Any]) -> None:
-            self._tasks.discard(finished)
-            if self._session_tails.get(session) is finished:
-                self._session_tails.pop(session, None)
+        async def send_serially() -> None:
+            async with lock:
+                await send()
+
+        task = asyncio.create_task(send_serially())
 
         self._tasks.add(task)
-        task.add_done_callback(_forget)
+        task.add_done_callback(self._tasks.discard)
+        if event is not None and self._register_background_task is not None:
+            self._register_background_task(event, task)
 
     def reap_expired(self) -> None:
         """回收过期 pending；首段已送达时只补发剩余段。
@@ -229,7 +262,9 @@ class FollowUpDispatcher:
             return
         now = time.monotonic()
         expired = [
-            (key, item) for key, item in self._pending.items() if item.expires_at <= now
+            (key, item)
+            for key, item in self._pending.items()
+            if item.expires_at <= now and not item.first_send_in_progress
         ]
         for key, item in expired:
             self._pending.pop(key, None)
@@ -258,22 +293,17 @@ class FollowUpDispatcher:
         # 必须排在同会话串行链后面：正常补发正在进行时插进去会把上一轮的 burst
         # 打断（用户看到的消息顺序被打乱）。
         self._track(
-            self._run_orphan(
-                pending,
-                self._session_tails.get(pending.session),
-                start_index=start_index,
-            ),
+            lambda: self._run_orphan(pending, start_index=start_index),
             pending.session,
+            pending.event,
         )
 
     async def _run_orphan(
         self,
         pending: PendingFollowUp,
-        previous: asyncio.Task[Any] | None = None,
         *,
         start_index: int = 1,
     ) -> None:
-        await self._wait_previous(previous)
         try:
             with self._guard_session(pending.session):
                 await self._send_merged_remainder(pending, start_index)
@@ -283,19 +313,6 @@ class FollowUpDispatcher:
             # 这已经是最后一道兜底，没有可再兜的东西：记一条日志，别让它打断
             # 同会话后面排队的任务。
             logger.warning("智能分段合并补发被平台取消")
-
-    @classmethod
-    async def _wait_previous(cls, previous: asyncio.Task[Any] | None) -> None:
-        if previous is None:
-            return
-        try:
-            await previous
-        except asyncio.CancelledError:
-            if is_caller_cancelled():
-                raise
-            # 上一轮是被平台取消的：本轮照常发自己的段
-        except Exception as exc:
-            logger.debug("上一轮补发任务异常已由自身记录: %s", brief_exception(exc))
 
     @contextmanager
     def _guard_session(self, session: str):
@@ -316,11 +333,9 @@ class FollowUpDispatcher:
     async def _run(
         self,
         pending: PendingFollowUp,
-        previous: asyncio.Task[Any] | None = None,
         *,
         start_index: int = 0,
     ) -> None:
-        await self._wait_previous(previous)
         index = start_index
         try:
             with self._guard_session(pending.session):

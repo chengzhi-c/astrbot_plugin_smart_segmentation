@@ -26,8 +26,8 @@ def is_plain_chain(message_chain: MessageChain) -> bool:
     Plain、其余 Plain 交给补发，At 就落到分段后第一条消息的末尾、后面没有正文——
     读 at.name 的协议端渲染成裸 @。宁可不分段，也不搬动链里的组件。
     """
-    chain = getattr(message_chain, "chain", None)
-    if not isinstance(chain, list) or not chain:
+    chain = message_chain.chain
+    if not chain:
         return False
     if not isinstance(chain[-1], Plain):
         return False

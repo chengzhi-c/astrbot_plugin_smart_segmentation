@@ -89,6 +89,18 @@
       "step": 0.1
     }
   },
+  "tail_clean_enabled": {
+    "type": "bool",
+    "description": "清理分段末尾符号",
+    "hint": "按下方符号列表清理普通分段和流式分段的末尾。",
+    "default": false
+  },
+  "tail_clean_marks": {
+    "type": "list",
+    "description": "要清理的末尾符号",
+    "hint": "每项填写一个符号，可自行增删；清空列表则保留末尾符号。开启上方开关后生效。",
+    "default": [".", ",", "，", "。", ";", "；", ":", "：", "、"]
+  },
   "streaming_compat_enabled": {
     "type": "bool",
     "description": "启用流式兼容模式",

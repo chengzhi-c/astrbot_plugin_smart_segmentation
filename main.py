@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageEventResult, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 
 from .bounds import STREAMING_SYNC_INTERVAL_SECONDS
@@ -19,7 +20,7 @@ from .chain_utils import (
 )
 from .errors import brief_exception
 from .follow_up import FollowUpDispatcher
-from .segmentation import has_visible_text
+from .segmentation import clean_segment_tail, has_visible_text, split_oversized_segments
 from .segmenter import OutboundSegmenter
 from .settings import SegmentationSettings, load_settings
 
@@ -83,17 +84,6 @@ class SmartSegmentationPlugin(Star):
         if not isinstance(texts, (list, tuple)):
             return []
         return [str(text or "").strip() for text in texts]
-
-    @staticmethod
-    def _plain_text_of(result: Any) -> str:
-        getter = getattr(result, "get_plain_text", None)
-        if not callable(getter):
-            return ""
-        try:
-            return str(getter() or "").strip()
-        except Exception as exc:
-            logger.debug("读取结果纯文本失败: %s", brief_exception(exc))
-            return ""
 
     def _host_segmented_reply_enabled(self, event: AstrMessageEvent) -> bool:
         """宿主内置分段回复开启时让位。
@@ -179,7 +169,14 @@ class SmartSegmentationPlugin(Star):
             return
 
         outbound_text = extract_plain_text_chain(result)
-        has_thinking_marker = "<think" in self._plain_text_of(result).lower()
+        has_thinking_marker = (
+            "<think"
+            in "".join(
+                component.text
+                for component in result.chain
+                if isinstance(component, Plain)
+            ).lower()
+        )
 
         def apply_outbound_text() -> None:
             """有 think 原文时把链归一成剥离后的正文。"""
@@ -218,13 +215,31 @@ class SmartSegmentationPlugin(Star):
         if not segments:
             apply_outbound_text()
             return
-        if self._stopping:
-            # terminate 可能落在分段调用期间：此时替换链会被 after_message_sent
-            # 丢弃补发，用户只看到首段。停止中保留清理过的正文。
-            logger.debug("智能分段跳过：插件正在停止")
+        if self._stopping or self._get_settings() is None:
+            # 停止或禁用可能落在模型调用期间；此时换链会让后续段被丢弃。
+            logger.debug("智能分段跳过：插件已停止或禁用")
             apply_outbound_text()
             return
 
+        # 内容校验完成后再清理，否则删掉逗号会被判为模型改写而退回本地分段。
+        if settings.tail_clean_enabled:
+            segments = [
+                clean_segment_tail(segment, settings.tail_clean_marks)
+                for segment in segments
+            ]
+
+        # 长度截断可能位于小数、代码或 URL 中间，必须在校验和尾部清理之后做。
+        segments = [
+            segment
+            for segment in split_oversized_segments(segments)
+            if has_visible_text(segment)
+        ]
+        sent_texts = self._host_already_sent_texts(event)
+        while segments and segments[0].strip() in sent_texts:
+            segments.pop(0)
+        if not segments:
+            result.chain.clear()
+            return
         first_segment = segments[0]
         # 先换链再登记是刻意顺序：登记成功但换链失败会造成补发 + 原链全文
         # 重复发送，比当前的失败模式（补发缺失）更差。
@@ -232,6 +247,7 @@ class SmartSegmentationPlugin(Star):
             return
 
         pending_id = self._follow_ups.register(
+            event=event,
             session=event.unified_msg_origin,
             segments=segments,
             settings=settings,
@@ -247,7 +263,7 @@ class SmartSegmentationPlugin(Star):
     def _already_sent(
         self,
         event: AstrMessageEvent,
-        result: Any,
+        result: MessageEventResult,
         outbound_text: str,
         apply_outbound_text: Callable[[], None],
     ) -> bool:
@@ -259,7 +275,7 @@ class SmartSegmentationPlugin(Star):
         sent_texts = self._host_already_sent_texts(event)
         if not sent_texts:
             return False
-        plain_text = self._plain_text_of(result)
+        plain_text = result.get_plain_text().strip()
         if plain_text and plain_text in sent_texts:
             logger.debug("智能分段跳过：该文本已由 send_message_to_user 发出")
             return True

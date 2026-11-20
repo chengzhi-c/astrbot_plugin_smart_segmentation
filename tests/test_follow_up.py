@@ -256,32 +256,7 @@ async def test_caller_cancelled_burst_does_not_send() -> None:
 
 
 @pytest.mark.asyncio
-async def test_wait_previous_swallows_platform_cancellation() -> None:
-    """上一轮任务是被取消的(不是我们自己被取消):本轮照常发自己的段,不能连坐。"""
-
-    started = asyncio.Event()
-    release = asyncio.Event()
-    finished = False
-
-    async def hang() -> None:
-        nonlocal finished
-        started.set()
-        try:
-            await release.wait()
-        finally:
-            finished = True
-
-    previous = asyncio.ensure_future(hang())
-    await asyncio.wait_for(started.wait(), timeout=1)
-    assert not previous.done()
-    previous.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await previous
-    assert previous.cancelled()
-
-    await FollowUpDispatcher._wait_previous(previous)  # 不应上抛
-    assert finished  # 真等过它:直接 return 的实现会在这里挂掉
-
+async def test_orphan_caller_cancellation_stops_send() -> None:
     class SlowContext(FakeContext):
         def __init__(self) -> None:
             super().__init__()
@@ -304,6 +279,46 @@ async def test_wait_previous_swallows_platform_cancellation() -> None:
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_cancelling_queued_burst_does_not_cancel_previous_send() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class SlowFirstContext(FakeContext):
+        async def send_message(self, session, chain):
+            if chain.get_plain_text() == "first":
+                started.set()
+                await release.wait()
+            return await super().send_message(session, chain)
+
+    ctx = SlowFirstContext()
+    dispatcher = FollowUpDispatcher(ctx, is_enabled=lambda: True)
+    tasks = []
+    try:
+        for segment in ("first", "second", "third"):
+            pending = dispatcher.pop(
+                dispatcher.register(
+                    session="s1", segments=[segment], settings=FAST_SETTINGS
+                )
+            )
+            dispatcher.schedule(pending, start_index=0)
+            tasks.append(next(task for task in dispatcher._tasks if task not in tasks))
+            if segment == "first":
+                await asyncio.wait_for(started.wait(), timeout=1)
+        queued_task = tasks[1]
+        await asyncio.sleep(0)
+        queued_task.cancel()
+        await asyncio.gather(queued_task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert ctx.sent == []
+        release.set()
+        await asyncio.gather(*dispatcher._tasks, return_exceptions=True)
+        assert ctx.sent == [("s1", "first"), ("s1", "third")]
+    finally:
+        release.set()
+        await dispatcher.shutdown()
 
 
 @pytest.mark.asyncio
@@ -503,14 +518,12 @@ async def test_shutdown_is_bounded_when_task_ignores_cancellation(monkeypatch) -
             await asyncio.sleep(10)
 
     dispatcher = FollowUpDispatcher(FakeContext(), is_enabled=lambda: True)  # type: ignore[arg-type]
-    dispatcher._track(stubborn(), "s1")
+    dispatcher._track(stubborn, "s1")
     task = next(iter(dispatcher._tasks))
     await asyncio.wait_for(started.wait(), timeout=1)
-    # 旧实现没有这个常量：raising=False 让红灯落在超时行为上，而不是 AttributeError。
     monkeypatch.setattr(
         "astrbot_plugin_smart_segmentation.follow_up.SHUTDOWN_TIMEOUT_SECONDS",
         0.05,
-        raising=False,
     )
     started = asyncio.get_running_loop().time()
     try:
