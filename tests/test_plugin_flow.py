@@ -72,6 +72,64 @@ class FakeContext:
 @pytest.mark.parametrize(
     "config,expected",
     [
+        ({"head_clean_enabled": False}, ["，开头，句中", "。第二句", "；·最后一句！"]),
+        ({}, ["开头，句中", "第二句", "·最后一句！"]),
+        (
+            {"head_clean_marks": ["，", "；", "·"]},
+            ["开头，句中", "。第二句", "最后一句！"],
+        ),
+        ({"head_clean_marks": ["，"]}, ["开头，句中", "。第二句", "；·最后一句！"]),
+        ({"head_clean_marks": []}, ["，开头，句中", "。第二句", "；·最后一句！"]),
+    ],
+)
+async def test_head_clean_reaches_first_and_followups(
+    config, expected, use_model: bool, caplog
+) -> None:
+    segments = ["，开头，句中", "。第二句", "；·最后一句！"]
+    ctx = FakeContext(json.dumps(segments) if use_model else "invalid-json")
+    plugin = SmartSegmentationPlugin(
+        ctx,
+        {"min_length": 2, "delay_max": 0, "head_clean_enabled": True, **config},
+    )
+    event = FakeEvent(FakeResult("\n".join(segments)))
+    try:
+        await plugin.on_decorating_result(event)
+        await event.send(event.get_result())
+        await plugin.after_message_sent(event)
+        await asyncio.gather(*list(plugin._follow_ups._tasks))
+        assert [
+            event.sent[0].get_plain_text(),
+            *[text for _, text in ctx.sent],
+        ] == expected
+        assert ("本次按标点拆分" not in caplog.text) is use_model
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parts", [["，", "；正文"], ["，", "；"]])
+async def test_head_clean_drops_empty_segments(parts) -> None:
+    plugin = SmartSegmentationPlugin(
+        FakeContext(json.dumps(parts)), {"min_length": 0, "head_clean_enabled": True}
+    )
+    result = FakeResult("".join(parts))
+    result.chain.insert(0, At(qq="123"))
+    try:
+        await plugin.on_decorating_result(FakeEvent(result))
+        if "；正文" in parts:
+            assert result.get_plain_text() == "正文"
+            assert isinstance(result.chain[0], At)
+        else:
+            assert result.chain == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_model", [False, True])
+@pytest.mark.parametrize(
+    "config,expected",
+    [
         ({"tail_clean_enabled": False}, ["开头，句中，，", "第二句", "末尾？！"]),
         ({}, ["开头，句中", "第二句", "末尾？！"]),
         ({"tail_clean_marks": ["？", "！"]}, ["开头，句中，，", "第二句。", "末尾"]),
@@ -136,13 +194,20 @@ async def test_tail_clean_drops_empty_segments(segments: list[str]) -> None:
         "```text\n" + "x" * 2991 + ";\nend;\n```",
         "https://example.com/" + "x" * 2980 + ";tail;",
         "x" * 1498 + "3.14，",
+        "x" * 1500 + "，正文",
     ],
-    ids=["fenced-code", "url", "decimal"],
+    ids=["fenced-code", "url", "decimal", "forced-leading-comma"],
 )
 async def test_tail_clean_preserves_content_at_forced_message_limit(text: str) -> None:
     ctx = FakeContext("not-json")
     plugin = SmartSegmentationPlugin(
-        ctx, {"min_length": 2, "delay_max": 0, "tail_clean_enabled": True}
+        ctx,
+        {
+            "min_length": 2,
+            "delay_max": 0,
+            "head_clean_enabled": True,
+            "tail_clean_enabled": True,
+        },
     )
     event = FakeEvent(FakeResult(text))
     try:
@@ -263,6 +328,8 @@ async def test_respond_stage_derived_chain_keeps_followups_after_conversion(
     derive: bool,
 ) -> None:
     """宿主转换首段后仍须认领其发送；Record 会先从原链抽走。"""
+    if derive and not hasattr(MessageEventResult, "derive"):
+        pytest.skip("当前 AstrBot 版本没有 MessageChain.derive")
     ctx = FakeContext()
     plugin = SmartSegmentationPlugin(
         ctx,
@@ -304,7 +371,7 @@ async def test_respond_stage_derived_chain_keeps_followups_after_conversion(
                     text=first_plain.text,
                 )
             ]
-            if "legacy" in conversion:
+            if "legacy" in conversion and hasattr(result.chain[0], "text"):
                 delattr(result.chain[0], "text")
             if "dual" in conversion:
                 result.chain.append(first_plain)
@@ -936,8 +1003,8 @@ async def test_guarded_decorate_clears_stale_bookkeeping() -> None:
     assert stale_id in plugin._follow_ups._pending  # type: ignore[attr-defined]
 
     # 模拟：上一轮登记了 pending，但 RespondStage 被跳过；本轮同 event 被守卫挡住
-    plugin._follow_ups._guards["sess:1"] = 1  # type: ignore[attr-defined]
-    await plugin.on_decorating_result(event)  # type: ignore[arg-type]
+    with plugin._follow_ups._guard_session(event.unified_msg_origin):
+        await plugin.on_decorating_result(event)  # type: ignore[arg-type]
     assert plugin._follow_ups.pending_id_of(event) == ""  # type: ignore[attr-defined]
     assert stale_id not in plugin._follow_ups._pending  # type: ignore[attr-defined]
 

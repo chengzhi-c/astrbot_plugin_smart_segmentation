@@ -166,6 +166,46 @@ async def test_stream_tail_clean_resumes_after_long_fenced_code(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [90, 10000])
+@pytest.mark.parametrize(
+    "atom",
+    [
+        "https://example.com/" + "x" * 4000 + ";\n",
+        '```json\n{"value":"' + "x" * 4000 + '"}\n```\n',
+    ],
+    ids=["url", "fenced-json-line"],
+)
+async def test_stream_tail_clean_scans_long_atoms_linearly(
+    atom: str, chunk_size: int, monkeypatch
+) -> None:
+    from astrbot_plugin_smart_segmentation.streaming import wrapper
+
+    scanned = 0
+    original = wrapper.mask_uncuttable_spans
+
+    def count_scan(text, **kwargs):
+        nonlocal scanned
+        scanned += len(text)
+        return original(text, **kwargs)
+
+    monkeypatch.setattr(wrapper, "mask_uncuttable_spans", count_scan)
+    text = atom + "后续正文，"
+
+    async def gen():
+        for start in range(0, len(text), chunk_size):
+            yield MessageChain([Plain(text[start : start + chunk_size])])
+
+    collected = [
+        chain
+        async for chain in stream_realtime_segments(
+            gen(), SegmentationSettings(tail_clean_enabled=True)
+        )
+    ]
+    assert "".join(part for _, part in _collected(collected)) == atom + "后续正文"
+    assert scanned < len(text) * 8
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("chunk_size", [1, 200])
 async def test_stream_tail_clean_preserves_tilde_fence(chunk_size) -> None:
     code = "a" * 17 + "\n~~~python\nprint('x');\n~~~\n"
@@ -444,7 +484,16 @@ async def test_stream_break_flushes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_exception_flushes_then_reraises() -> None:
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("前", "前"),
+        ("说明 `<think>secret</think>可见正文", "说明 `可见正文"),
+        ("正文<thi", "正文<thi"),
+        ("正文<think>secret", "正文"),
+    ],
+)
+async def test_stream_exception_flushes_then_reraises(text, expected) -> None:
     """源流异常必须先 flush 已缓冲内容，再上抛。
 
     吞掉异常会让平台以为流正常结束，用户拿到静默截断的回复；未打补丁的核心
@@ -452,7 +501,7 @@ async def test_stream_exception_flushes_then_reraises() -> None:
     """
 
     async def gen():
-        yield MessageChain([Plain("前")])
+        yield MessageChain([Plain(text)])
         raise RuntimeError("boom")
 
     settings = SegmentationSettings(streaming_min_chars=2, streaming_max_chars=90)
@@ -460,7 +509,7 @@ async def test_stream_exception_flushes_then_reraises() -> None:
     with pytest.raises(RuntimeError):
         async for chain in stream_realtime_segments(gen(), settings):
             collected.append(chain)
-    assert _collected(collected) == [("plain", "前")]
+    assert _collected(collected) == [("plain", expected)]
 
 
 @pytest.mark.asyncio

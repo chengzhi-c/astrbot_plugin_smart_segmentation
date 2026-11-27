@@ -129,7 +129,8 @@ async def test_follow_up_stops_when_disabled_mid_burst() -> None:
 
 
 @pytest.mark.asyncio
-async def test_follow_up_holds_session_guard_while_sending() -> None:
+@pytest.mark.parametrize("fail_first", [False, True])
+async def test_follow_up_holds_session_guard_while_sending(fail_first: bool) -> None:
     """补发执行期间必须持有会话守卫：否则同会话新回复会与本轮补发交错，
     主处理器也可能被补发重新触发。"""
     guarded_during_send: list[bool] = []
@@ -137,6 +138,8 @@ async def test_follow_up_holds_session_guard_while_sending() -> None:
     class GuardCheckingContext(FakeContext):
         async def send_message(self, session, chain):
             guarded_during_send.append(self._dispatcher.is_session_guarded(session))
+            if fail_first and len(guarded_during_send) == 1:
+                raise TimeoutError("delivery status unknown")
             return await super().send_message(session, chain)
 
     ctx = GuardCheckingContext()

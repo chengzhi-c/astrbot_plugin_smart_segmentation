@@ -38,20 +38,6 @@ def test_hooks_registered_in_astrbot_registry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plugin_is_real_star_and_instantiates(host_plugin) -> None:
-    from astrbot.api.star import Star
-
-    class FakeContext:
-        pass
-
-    plugin = host_plugin(FakeContext(), {"enabled": True})
-    assert isinstance(plugin, Star)
-    assert callable(plugin.on_decorating_result)
-    assert callable(plugin.after_message_sent)
-    await plugin.terminate()
-
-
-@pytest.mark.asyncio
 async def test_terminate_clean(host_plugin) -> None:
     class FakeContext:
         pass

@@ -6,7 +6,12 @@ import re
 from itertools import pairwise
 from typing import Any
 
-from .bounds import DEFAULT_TAIL_CLEAN_MARKS, DELAY_JITTER_SECONDS, MAX_SEGMENT_CHARS
+from .bounds import (
+    DEFAULT_HEAD_CLEAN_MARKS,
+    DEFAULT_TAIL_CLEAN_MARKS,
+    DELAY_JITTER_SECONDS,
+    MAX_SEGMENT_CHARS,
+)
 
 # 标签的属性段必须限字符集与长度：[^>]* 能一路吃到下一个 ">"（跨行、跨整段
 # 正文），把可见内容当属性删掉。
@@ -209,7 +214,8 @@ BRACKET_PAIRS: tuple[tuple[str, str], ...] = (
 )
 STRONG_BOUNDARY_MARKS = "。？！~…!?"
 WEAK_BOUNDARY_MARKS = "，,；;、 "
-_NUMBER_RE = re.compile(r"\d+(?:[.,:：]\d+)+")
+# 只从数字串起点扫描，避免纯数字长串在每个位置重复回溯。
+_NUMBER_RE = re.compile(r"(?<!\d)(?:\d+(?:[.,:：]\d+)+|\.\d+)")
 SENTENCE_BOUNDARY_RE = re.compile(
     rf"[^{re.escape(STRONG_BOUNDARY_MARKS)}\n]+[{re.escape(STRONG_BOUNDARY_MARKS)}]*",
 )
@@ -218,6 +224,19 @@ SENTENCE_BOUNDARY_RE = re.compile(
 def has_visible_text(text: str) -> bool:
     """str.strip() 会保留零宽格式字符，它们单独成段时没有可见正文。"""
     return any(char.isprintable() and not char.isspace() for char in text)
+
+
+def clean_segment_head(text: str, marks: str = DEFAULT_HEAD_CLEAN_MARKS) -> str:
+    start = len(text) - len(text.lstrip())
+    end = start
+    while end < len(text) and (text[end] in marks or text[end].isspace()):
+        # 图片标记、相对路径前缀和小数点属于内容。
+        if text.startswith(("![", "./", "../", ".\\", "..\\"), end) or _NUMBER_RE.match(
+            text, end
+        ):
+            break
+        end += 1
+    return text[:start] + text[end:]
 
 
 def clean_segment_tail(
@@ -378,25 +397,6 @@ def _long_link_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _mask_long_links(text: str, atoms: list[str]) -> str:
-    """给限长链接正则漏掉的超长链接整段遮罩。
-
-    退回「只遮 URL」不行：[] 与 () 仍是结构字符，链接会被括号 stage 拆成多条。
-    """
-    spans = _long_link_spans(text)
-    if not spans:
-        return text
-    parts: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        atoms.append(text[start:end])
-        parts.append(text[cursor:start])
-        parts.append(f"\ue000{len(atoms) - 1}\ue001")
-        cursor = end
-    parts.append(text[cursor:])
-    return "".join(parts)
-
-
 def mask_uncuttable_spans(
     text: str, *, open_tails: bool = False
 ) -> list[tuple[int, int]]:
@@ -494,22 +494,6 @@ def _bracket_link_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
-def _mask_bracket_links(text: str, atoms: list[str]) -> str:
-    """按方括号平衡判定链接边界，遮罩正则收不住的外层链接。"""
-    spans = _bracket_link_spans(text)
-    if not spans:
-        return text
-    parts: list[str] = []
-    cursor = 0
-    for start, end in spans:
-        atoms.append(text[start:end])
-        parts.append(text[cursor:start])
-        parts.append(f"\ue000{len(atoms) - 1}\ue001")
-        cursor = end
-    parts.append(text[cursor:])
-    return "".join(parts)
-
-
 def _mask_atoms(text: str, atoms: list[str]) -> str:
     """把不可切的原子换成不含标点的占位符，顺序为「围栏 → 表格 → 行内代码 → 链接 → 裸 URL」。
 
@@ -533,10 +517,19 @@ def _mask_atoms(text: str, atoms: list[str]) -> str:
     # 围栏已整块换掉，剩下的反引号都是行内的。
     text = _INLINE_CODE_RE.sub(_replace, text)
     if _NESTED_OPEN_RE.search(text):
-        text = _mask_bracket_links(text, atoms)
+        spans = _bracket_link_spans(text)
     else:
         text = _MD_LINK_RE.sub(_replace, text)
-        text = _mask_long_links(text, atoms)
+        spans = _long_link_spans(text)
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        atoms.append(text[start:end])
+        parts.append(text[cursor:start])
+        parts.append(f"\ue000{len(atoms) - 1}\ue001")
+        cursor = end
+    parts.append(text[cursor:])
+    text = "".join(parts)
     return _URL_RE.sub(_replace, text)
 
 
@@ -545,9 +538,7 @@ def _unmask_atoms(text: str, atoms: list[str]) -> str:
         return text
 
     def _restore(match: re.Match[str]) -> str:
-        index = int(match.group(1))
-        # 正文里恰好出现同形的私用区字符时不能炸：原样保留那一段
-        return atoms[index] if 0 <= index < len(atoms) else match.group(0)
+        return atoms[int(match.group(1))]
 
     return _URL_MASK_RE.sub(_restore, text)
 
@@ -735,11 +726,11 @@ def strip_thinking_content(text: str) -> str:
     if not text:
         return ""
     thinking_filter = _ThinkingFilter()
-    return (thinking_filter.feed(str(text)) + thinking_filter.finish()).strip()
+    return (thinking_filter.feed(text) + thinking_filter.finish()).strip()
 
 
 def extract_json_array_text(raw_text: str) -> str:
-    result_text = str(raw_text or "").strip()
+    result_text = raw_text.strip()
     candidates: list[str] = []
     fenced_json = re.search(
         r"```\s*json\s*(.*?)```",
@@ -771,7 +762,7 @@ def extract_json_array_text(raw_text: str) -> str:
 
 
 def is_action_only_text(text: str) -> bool:
-    stripped = str(text or "").strip()
+    stripped = text.strip()
     if len(stripped) < 2:
         return False
 
@@ -892,7 +883,7 @@ def _stage_lines(segments: list[str]) -> list[str]:
     """对每段按换行拆分；action-only 段保持完整。"""
     result: list[str] = []
     for seg in segments:
-        s = str(seg or "").strip()
+        s = seg.strip()
         if not s:
             continue
         if is_action_only_text(s):
@@ -974,9 +965,7 @@ def same_content(
     普通文本允许空白差异，代码的内容和空白必须完全一致。
     未启用自定义清理时，沿用省略单个句末「。」的规则。
     """
-    patterns = (_FENCE_RE, _INLINE_CODE_RE, _URL_RE)
-    if tail_clean_enabled:
-        patterns += (_NUMBER_RE,)
+    patterns = (_FENCE_RE, _INLINE_CODE_RE, _URL_RE, _NUMBER_RE)
     for pattern in patterns:
         if [
             match.group(0)
@@ -1057,6 +1046,7 @@ def build_segmentation_prompt(
 规则：
 - 不要改写原意，不要补充新信息
 - {punctuation_rule}
+- 分段时把句读标点留在上一条末尾，下一条从正文开始
 - 不要每个逗号都拆开，相关的内容放在一条里
 - 消息长短可以不均匀
 - 不要在单个数组元素内部使用换行；如果你想换行，就拆成数组中的下一项

@@ -20,7 +20,12 @@ from .chain_utils import (
 )
 from .errors import brief_exception
 from .follow_up import FollowUpDispatcher
-from .segmentation import clean_segment_tail, has_visible_text, split_oversized_segments
+from .segmentation import (
+    clean_segment_head,
+    clean_segment_tail,
+    has_visible_text,
+    split_oversized_segments,
+)
 from .segmenter import OutboundSegmenter
 from .settings import SegmentationSettings, load_settings
 
@@ -222,13 +227,18 @@ class SmartSegmentationPlugin(Star):
             return
 
         # 内容校验完成后再清理，否则删掉逗号会被判为模型改写而退回本地分段。
+        if settings.head_clean_enabled:
+            segments = [
+                clean_segment_head(segment, settings.head_clean_marks)
+                for segment in segments
+            ]
         if settings.tail_clean_enabled:
             segments = [
                 clean_segment_tail(segment, settings.tail_clean_marks)
                 for segment in segments
             ]
 
-        # 长度截断可能位于小数、代码或 URL 中间，必须在校验和尾部清理之后做。
+        # 长度截断可能位于小数、代码或 URL 中间，必须在校验和首尾清理之后做。
         segments = [
             segment
             for segment in split_oversized_segments(segments)

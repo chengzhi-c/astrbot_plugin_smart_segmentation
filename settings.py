@@ -9,6 +9,7 @@ from typing import Any
 
 from .bounds import (
     ALLOWED_STYLES,
+    DEFAULT_HEAD_CLEAN_MARKS,
     DEFAULT_TAIL_CLEAN_MARKS,
     MAX_DELAY_BASE,
     MAX_DELAY_MAX,
@@ -31,6 +32,8 @@ class SegmentationSettings:
     delay_base: float = 0.8
     delay_per_char: float = 0.025
     delay_max: float = 2.5
+    head_clean_enabled: bool = False
+    head_clean_marks: str = DEFAULT_HEAD_CLEAN_MARKS
     tail_clean_enabled: bool = False
     tail_clean_marks: str = DEFAULT_TAIL_CLEAN_MARKS
     streaming_compat_enabled: bool = False
@@ -155,6 +158,13 @@ def load_settings(config: Mapping[str, Any]) -> SegmentationSettings | None:
             defaults.delay_max,
             0.0,
             MAX_DELAY_MAX,
+        ),
+        head_clean_enabled=as_bool(
+            config.get("head_clean_enabled", defaults.head_clean_enabled),
+            defaults.head_clean_enabled,
+        ),
+        head_clean_marks="".join(
+            config.get("head_clean_marks", defaults.head_clean_marks)
         ),
         tail_clean_enabled=as_bool(
             config.get("tail_clean_enabled", defaults.tail_clean_enabled),

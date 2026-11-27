@@ -89,6 +89,18 @@
       "step": 0.1
     }
   },
+  "head_clean_enabled": {
+    "type": "bool",
+    "description": "清理分段开头符号",
+    "hint": "按下方符号列表清理普通分段的开头，独立于末尾清理。",
+    "default": false
+  },
+  "head_clean_marks": {
+    "type": "list",
+    "description": "要清理的开头符号",
+    "hint": "每项填写一个符号，可自行增删；清空列表则停止段首清理。开启上方开关后生效。",
+    "default": [".", ",", "，", "。", ";", "；", ":", "：", "、"]
+  },
   "tail_clean_enabled": {
     "type": "bool",
     "description": "清理分段末尾符号",

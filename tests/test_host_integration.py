@@ -13,7 +13,7 @@ from astrbot.api.event import (
     MessageEventResult,
     ResultContentType,
 )
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Plain, Record
 from astrbot.builtin_stars.builtin_commands.commands.conversation import (
     ConversationCommands,
 )
@@ -26,9 +26,8 @@ from astrbot.core.platform.sources.webchat.webchat_event import (
     WebChatMessageEvent,
     webchat_queue_mgr,
 )
-from astrbot.core.star.star import star_map
+from astrbot.core.star.star import StarMetadata, star_map
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
-from astrbot.core.utils.active_event_registry import active_event_registry
 from astrbot_plugin_smart_segmentation.main import SmartSegmentationPlugin
 from astrbot_plugin_smart_segmentation.settings import SegmentationSettings
 from astrbot_plugin_smart_segmentation.streaming.wrapper import stream_realtime_segments
@@ -123,7 +122,7 @@ def bind_after(plugin, monkeypatch):
     monkeypatch.setitem(
         star_map,
         module_name,
-        SimpleNamespace(activated=True, name=name, reserved=False),
+        StarMetadata(activated=True, name=name, reserved=False),
     )
     (handler,) = star_handlers_registry.get_handlers_by_event_type(
         EventType.OnAfterMessageSentEvent
@@ -206,7 +205,18 @@ async def test_first_send_can_finish_after_pre_send_processing_exceeds_ttl(monke
         await plugin.terminate()
 
 
-async def test_host_stop_after_foreground_releases_event(monkeypatch):
+@pytest.mark.parametrize(
+    ("after_hook", "expire_before_send"),
+    [(True, False), (False, False), (False, True)],
+    ids=["scheduled", "pending", "restored-pending"],
+)
+async def test_host_stop_after_foreground_releases_event(
+    monkeypatch, after_hook, expire_before_send
+):
+    registry = pytest.importorskip("astrbot.core.utils.active_event_registry")
+    active_event_registry = registry.active_event_registry
+    if not hasattr(active_event_registry, "register_background_task"):
+        pytest.skip("当前 AstrBot 版本没有后台任务停止接口")
     context = ContextStub()
     plugin = plugin_with(context, delay_base=0.05, delay_max=0.05)
     bind_after(plugin, monkeypatch)
@@ -215,14 +225,53 @@ async def test_host_stop_after_foreground_releases_event(monkeypatch):
     active_event_registry.register(event)
     try:
         await plugin.on_decorating_result(event)
-        await respond_stage().process(event)
+        if expire_before_send:
+            pending = next(iter(plugin._follow_ups._pending.values()))
+            pending.expires_at = time.monotonic() - 1
+            plugin._follow_ups.reap_expired()
+        if after_hook:
+            await respond_stage().process(event)
+        else:
+            await event.send(event.get_result())
         active_event_registry.unregister(event)
         await asyncio.sleep(0)
-        tasks = list(plugin._follow_ups._tasks)
         await ConversationCommands(context).stop(command)
+        for pending in plugin._follow_ups._pending.values():
+            pending.expires_at = time.monotonic() - 1
+        plugin._follow_ups.reap_expired()
+        tasks = list(plugin._follow_ups._tasks)
         await asyncio.gather(*tasks, return_exceptions=True)
+        assert event.get_extra("agent_stop_requested") is True
         assert all(task.cancelled() for task in tasks)
         assert context.sent == []
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.parametrize("unknown_first", [False, True])
+@pytest.mark.parametrize("other_succeeded", [False, True])
+async def test_tts_mixed_send_outcomes_do_not_repeat_first_segment(
+    monkeypatch, unknown_first, other_succeeded
+):
+    class MixedEvent(MemoryEvent):
+        async def send(self, message):
+            is_voice = isinstance(message.chain[0], Record)
+            if is_voice is unknown_first:
+                raise TimeoutError("submitted before acknowledgement was lost")
+            return None if other_succeeded else False
+
+    context = ContextStub()
+    plugin = plugin_with(context)
+    bind_after(plugin, monkeypatch)
+    event = event_with("第一部分。第二部分。", MixedEvent)
+    try:
+        await plugin.on_decorating_result(event)
+        result = event.get_result()
+        first_plain = result.chain[0]
+        result.chain.insert(0, Record(file="file:///unused.wav", text=first_plain.text))
+        await respond_stage().process(event)
+        await drain(plugin)
+        assert context.sent == (["第二部分"] if other_succeeded else [])
     finally:
         await plugin.terminate()
 
@@ -295,21 +344,21 @@ async def test_validated_model_segmentation_keeps_url_whole(monkeypatch):
         await plugin.terminate()
 
 
-async def test_webchat_hard_length_cut_keeps_word_separator(monkeypatch):
-    async def put(_request, payload):
-        payloads.append(payload)
-        return True
-
-    monkeypatch.setattr(webchat_queue_mgr, "put_back_queue", put)
-    payloads = []
+async def test_webchat_hard_length_cut_keeps_word_separator():
     event = event_with(event_type=WebChatMessageEvent)
     text = "one two three four five six seven eight"
     settings = SegmentationSettings(streaming_min_chars=10, streaming_max_chars=20)
-    await event.send_streaming(stream_realtime_segments(source(text), settings))
-    complete = [
-        payload["data"] for payload in payloads if payload["type"] == "complete"
-    ]
-    assert complete == [text]
+    request_id = event.message_obj.message_id
+    queue = webchat_queue_mgr.get_or_create_back_queue(request_id)
+    try:
+        await event.send_streaming(stream_realtime_segments(source(text), settings))
+        payloads = [queue.get_nowait() for _ in range(queue.qsize())]
+        complete = [
+            payload["data"] for payload in payloads if payload["type"] == "complete"
+        ]
+        assert complete == [text]
+    finally:
+        webchat_queue_mgr.remove_back_queue(request_id)
 
 
 async def test_long_split_does_not_send_format_only_first_chunk(monkeypatch):

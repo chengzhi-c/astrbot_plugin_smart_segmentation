@@ -8,6 +8,7 @@ from __future__ import annotations
 
 PLUGIN_NAME = "astrbot_plugin_smart_segmentation"
 DEFAULT_TAIL_CLEAN_MARKS = ".,，。;；:：、"
+DEFAULT_HEAD_CLEAN_MARKS = DEFAULT_TAIL_CLEAN_MARKS
 
 # Keep in sync with _conf_schema.json slider max for user-facing fields.
 MAX_MIN_LENGTH = 200

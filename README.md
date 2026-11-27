@@ -1,6 +1,6 @@
 # AstrBot 智能分段插件
 
-> v0.3.0 · 变更见 [CHANGELOG](CHANGELOG.md)
+> v0.3.1 · 变更见 [CHANGELOG](CHANGELOG.md)
 
 把主 LLM 回复拆成几条自然消息：先发首段，再按延迟异步补发剩余段。分段由 LLM 决定，超时或输出不可用时退回本地标点规则。
 
@@ -22,12 +22,16 @@
 | `max_segments` | 目标分段数量；内容装不下时可能超过该值 |
 | `timeout_seconds` | 等模型超过该时间就改用本地规则 |
 | `delay_base` / `delay_per_char` / `delay_max` | 补发间隔：基础延迟 + 字数 × 按字符延迟 + 0~0.15 秒随机抖动，上限 `delay_max` |
+| `head_clean_enabled` | 清理普通分段开头符号，默认关，与末尾清理独立 |
+| `head_clean_marks` | 要清理的开头符号列表，可自行增删；默认 `.,，。;；:：、` |
 | `tail_clean_enabled` | 清理分段末尾符号，默认关；在插件配置中开启「清理分段末尾符号」 |
 | `tail_clean_marks` | 要清理的末尾符号列表，可自行增删；默认 `.,，。;；:：、` |
 | `streaming_compat_enabled` | 流式兼容，默认关 |
 | `streaming_min_chars` / `streaming_max_chars` | 流式拆段的长度闸门 |
 
 使用前请关闭 AstrBot 内置分段回复（`platform_settings.segmented_reply.enable`）。
+
+「清理分段开头符号」作用于普通回复的首段和补发段。例如 `你好` / `，世界` 会变为 `你好` / `世界`。符号由列表配置，清空列表则停止段首清理。
 
 末尾清理适用于首段、补发段和流式分段。符号列表可增删，清空列表则保留尾符号；句中标点、代码和链接保持原样。
 

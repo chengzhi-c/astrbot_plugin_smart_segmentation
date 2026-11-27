@@ -140,21 +140,30 @@ async def test_custom_tail_marks_control_model_omission(marks, accepted, caplog)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tail_clean_enabled", [False, True])
 @pytest.mark.parametrize(
     "source,parts",
     [
         ("你好，朋友。再见", ["你好朋友", "再见"]),
         ("数值3.14。再见", ["数值3.", "14。再见"]),
+        ("约.5元", ["约", "5元"]),
+        ("明天12:30开会", ["明天12", ":30开会"]),
         ("看https://example.com/a;b。再见", ["看https://example.com/a", "b。再见"]),
     ],
-    ids=["internal-comma", "decimal-boundary", "url-boundary"],
+    ids=[
+        "internal-comma",
+        "decimal-boundary",
+        "leading-decimal",
+        "time-boundary",
+        "url-boundary",
+    ],
 )
-async def test_tail_clean_still_rejects_model_content_changes(source, parts, caplog):
+async def test_rejects_model_content_changes(source, parts, tail_clean_enabled, caplog):
     context = FakeContext(completion=json.dumps(parts))
     await OutboundSegmenter(context).segment(
         SimpleNamespace(unified_msg_origin="sess:1"),
         source,
-        SegmentationSettings(min_length=2, tail_clean_enabled=True),
+        SegmentationSettings(min_length=2, tail_clean_enabled=tail_clean_enabled),
     )
     assert "分段结果与原文不一致" in caplog.text
 

@@ -14,6 +14,7 @@ from ..bounds import PLUGIN_NAME
 from ..errors import brief_exception
 from ..segmentation import (
     _FENCE_RE,
+    _URL_RE,
     STRONG_BOUNDARY_MARKS,
     WEAK_BOUNDARY_MARKS,
     _ThinkingFilter,
@@ -215,10 +216,18 @@ async def stream_realtime_segments(
         tail_context = (
             combined[spans[-1][0] :] if spans and spans[-1][1] == len(combined) else ""
         )
-        # 已发完的代码行不影响后续围栏识别，只保留开围栏和当前行。
-        if "\n" in tail_context and _FENCE_RE.match(tail_context):
-            opening, _, rest = tail_context.partition("\n")
-            tail_context = opening + "\n" + rest.rsplit("\n", 1)[-1]
+        # 已发送内容只保留后续边界识别需要的部分，避免长行被逐段重复扫描。
+        if "\n" in tail_context and (fence := _FENCE_RE.match(tail_context)):
+            current_line = tail_context.rsplit("\n", 1)[-1]
+            marker = re.escape(fence.group("fence")[0])
+            if not re.fullmatch(rf" {{0,3}}(?:{marker}+[ \t]*\r?)?", current_line):
+                current_line = "x"
+            tail_context = fence.group("fence") + "\n" + current_line
+        elif _URL_RE.fullmatch(tail_context) and not any(
+            char in tail_context for char in "`["
+        ):
+            # 反引号和方括号可能与下一块组成代码或链接，不能一并压掉。
+            tail_context = tail_context.split("://", 1)[0] + "://x"
         # 下一块尚未到达时，数字后的逗号可能是千位分隔符。
         if not final and len(text) >= 2 and text[-2].isdigit() and text[-1] in ".,":
             return text
@@ -320,6 +329,8 @@ async def stream_realtime_segments(
         # 冒泡到平台，吞掉它会让用户拿到静默截断的回复还以为发送成功。
         # exc_info 不开：堆栈会写进产品日志，摘要足够定位，与 patches/follow_up 同口径。
         logger.error("智能分段流式兼容处理异常: %s", brief_exception(exc))
+        for segment in add_text(thinking_filter.finish()):
+            yield make_stream_segment_chain(segment, take_decorations())
         if (flushed := flush()) is not None:
             yield flushed
         raise

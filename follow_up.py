@@ -43,8 +43,10 @@ class PendingFollowUp:
     expires_at: float
     first_send_delivered: bool = False
     first_send_failed: bool = False
+    first_send_unknown: bool = False
     first_send_in_progress: bool = False
     event: Any = None
+    handoff: asyncio.Event | None = None
 
 
 class FollowUpDispatcher:
@@ -58,11 +60,12 @@ class FollowUpDispatcher:
         self._is_enabled = is_enabled
         self._pending: dict[str, PendingFollowUp] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._pending_waiters: set[asyncio.Task[bool]] = set()
         # 在途任务持有锁；最后一个任务结束后会话锁自动释放。
         self._session_locks: WeakValueDictionary[str, asyncio.Lock] = (
             WeakValueDictionary()
         )
-        self._guards: dict[str, int] = {}
+        self._guards: set[str] = set()
         self._stopping = False
         # 旧宿主没有后台任务注册接口，保留原来的插件内任务管理。
         self._register_background_task = getattr(
@@ -74,7 +77,9 @@ class FollowUpDispatcher:
 
     async def shutdown(self) -> None:
         self._stopping = True
-        to_cancel = [task for task in self._tasks if not task.done()]
+        to_cancel = [
+            task for task in self._tasks | self._pending_waiters if not task.done()
+        ]
         for task in to_cancel:
             task.cancel()
         if to_cancel:
@@ -89,13 +94,13 @@ class FollowUpDispatcher:
                     len(pending),
                 )
         self._tasks.clear()
+        self._pending_waiters.clear()
         self._session_locks.clear()
         self._pending.clear()
         self._guards.clear()
 
     def is_session_guarded(self, session: str) -> bool:
-        normalized = str(session or "").strip()
-        return bool(normalized and self._guards.get(normalized, 0))
+        return session in self._guards
 
     # --- event bookkeeping (de-dupe + pending handoff) ---
 
@@ -133,7 +138,7 @@ class FollowUpDispatcher:
                 and record is not None
                 and not (record.first_send_delivered or record.first_send_failed)
             ):
-                dispatcher._pending[pending_id] = record
+                dispatcher._hold_pending(pending_id, record)
             pending = (
                 dispatcher._pending.get(pending_id)
                 if pending_id
@@ -144,12 +149,18 @@ class FollowUpDispatcher:
                 pending.first_send_in_progress = True
             try:
                 result = await original_send(message)
+            except (Exception, asyncio.CancelledError):
+                if pending is not None:
+                    # TTS 与文字可能分别发送；一次未知结果不能被另一次明确失败覆盖。
+                    pending.first_send_unknown = True
+                    pending.first_send_failed = False
+                raise
             finally:
                 if pending is not None:
                     pending.first_send_in_progress = False
             if pending is not None:
                 if result is False:
-                    pending.first_send_failed = True
+                    pending.first_send_failed = not pending.first_send_unknown
                 else:
                     pending.first_send_delivered = True
             return result
@@ -183,7 +194,7 @@ class FollowUpDispatcher:
         return marker is not None and marker is result
 
     def pending_id_of(self, event: Any) -> str:
-        return str(event.get_extra(_PENDING_EXTRA_KEY, "") or "").strip()
+        return event.get_extra(_PENDING_EXTRA_KEY, "")
 
     def clear_extras(self, event: Any) -> None:
         event.set_extra(_PENDING_EXTRA_KEY, "")
@@ -201,7 +212,7 @@ class FollowUpDispatcher:
     ) -> str:
         self.reap_expired()
         pending_id = uuid4().hex
-        self._pending[pending_id] = PendingFollowUp(
+        pending = PendingFollowUp(
             session=session,
             segments=tuple(segments),
             delay_base=settings.delay_base,
@@ -210,16 +221,30 @@ class FollowUpDispatcher:
             expires_at=time.monotonic() + PENDING_FOLLOW_UP_TTL_SECONDS,
             event=event,
         )
+        self._hold_pending(pending_id, pending)
         return pending_id
+
+    def _hold_pending(self, pending_id: str, pending: PendingFollowUp) -> None:
+        self._pending[pending_id] = pending
+        if pending.event is not None and self._register_background_task is not None:
+            # 前台结束但交接钩子缺失时，宿主仍需能找到并停止这轮待补发内容。
+            pending.handoff = asyncio.Event()
+            waiter = asyncio.create_task(pending.handoff.wait())
+            self._pending_waiters.add(waiter)
+            waiter.add_done_callback(self._pending_waiters.discard)
+            self._register_background_task(pending.event, waiter)
 
     def pop(self, pending_id: str) -> PendingFollowUp | None:
         # 先取再清理：被显式认领的 pending 即使刚过 TTL 也要交付。
-        pending = self._pending.pop(pending_id, None)
+        pending = self.discard(pending_id)
         self.reap_expired()
         return pending
 
-    def discard(self, pending_id: str) -> None:
-        self._pending.pop(pending_id, None)
+    def discard(self, pending_id: str) -> PendingFollowUp | None:
+        pending = self._pending.pop(pending_id, None)
+        if pending is not None and pending.handoff is not None:
+            pending.handoff.set()
+        return pending
 
     def schedule(self, pending: PendingFollowUp, *, start_index: int = 1) -> None:
         if self._stopping:
@@ -267,7 +292,7 @@ class FollowUpDispatcher:
             if item.expires_at <= now and not item.first_send_in_progress
         ]
         for key, item in expired:
-            self._pending.pop(key, None)
+            self.discard(key)
             self._deliver_orphan(item)
 
     def flush_stale(self, pending_id: str) -> None:
@@ -276,7 +301,7 @@ class FollowUpDispatcher:
         对应 bug：上一轮结果链已被替换成首段，而 after_message_sent 根本没被调用
         （例如装饰后被代次/停止检查抑制），旧回复不得因此重新发出。
         """
-        pending = self._pending.pop(str(pending_id or "").strip(), None)
+        pending = self.discard(pending_id)
         if pending is not None:
             self._deliver_orphan(pending)
 
@@ -304,31 +329,17 @@ class FollowUpDispatcher:
         *,
         start_index: int = 1,
     ) -> None:
-        try:
-            with self._guard_session(pending.session):
-                await self._send_merged_remainder(pending, start_index)
-        except asyncio.CancelledError:
-            if is_caller_cancelled():
-                raise
-            # 这已经是最后一道兜底，没有可再兜的东西：记一条日志，别让它打断
-            # 同会话后面排队的任务。
-            logger.warning("智能分段合并补发被平台取消")
+        with self._guard_session(pending.session):
+            await self._send_merged_remainder(pending, start_index)
 
     @contextmanager
     def _guard_session(self, session: str):
-        normalized = str(session or "").strip()
-        if not normalized:
-            yield
-            return
-        self._guards[normalized] = self._guards.get(normalized, 0) + 1
+        # 同会话的发送已由 _track 串行化，守卫不会重入。
+        self._guards.add(session)
         try:
             yield
         finally:
-            remaining = self._guards.get(normalized, 0) - 1
-            if remaining > 0:
-                self._guards[normalized] = remaining
-            else:
-                self._guards.pop(normalized, None)
+            self._guards.discard(session)
 
     async def _run(
         self,
@@ -337,8 +348,8 @@ class FollowUpDispatcher:
         start_index: int = 0,
     ) -> None:
         index = start_index
-        try:
-            with self._guard_session(pending.session):
+        with self._guard_session(pending.session):
+            try:
                 for index, segment in enumerate(
                     pending.segments[start_index:],
                     start=start_index,
@@ -368,26 +379,26 @@ class FollowUpDispatcher:
                             len(pending.segments) - index,
                         )
                         return
-        except asyncio.CancelledError:
-            if is_caller_cancelled():
-                logger.debug(
-                    "智能分段后台补发任务被取消（预期路径）",
+            except asyncio.CancelledError:
+                if is_caller_cancelled():
+                    logger.debug(
+                        "智能分段后台补发任务被取消（预期路径）",
+                    )
+                    raise
+                # 平台取消可能发生在提交之后：当前段不重发，其余段继续补发。
+                logger.warning(
+                    "智能分段补发被平台取消，当前段发送状态未知，后续 %s 段将合并补发",
+                    len(pending.segments) - index - 1,
                 )
-                raise
-            # 平台取消可能发生在提交之后：当前段不重发，其余段继续补发。
-            logger.warning(
-                "智能分段补发被平台取消，当前段发送状态未知，后续 %s 段将合并补发",
-                len(pending.segments) - index - 1,
-            )
-            await self._send_merged_remainder(pending, index + 1)
-        except Exception as exc:
-            # send_message 抛错不能证明未提交，合并补发只包含后续段。
-            logger.error(
-                "智能分段后台补发任务异常，当前段发送状态未知，后续 %s 段将合并补发，错误: %s",
-                len(pending.segments) - index - 1,
-                brief_exception(exc),
-            )
-            await self._send_merged_remainder(pending, index + 1)
+                await self._send_merged_remainder(pending, index + 1)
+            except Exception as exc:
+                # send_message 抛错不能证明未提交，合并补发只包含后续段。
+                logger.error(
+                    "智能分段后台补发任务异常，当前段发送状态未知，后续 %s 段将合并补发，错误: %s",
+                    len(pending.segments) - index - 1,
+                    brief_exception(exc),
+                )
+                await self._send_merged_remainder(pending, index + 1)
 
     async def _send_merged_remainder(
         self,

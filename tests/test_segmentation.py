@@ -22,6 +22,7 @@ from astrbot_plugin_smart_segmentation.segmentation import (
     build_segmentation_prompt,
     calculate_send_delay,
     cap_segments,
+    clean_segment_head,
     clean_segment_tail,
     extract_json_array_text,
     is_action_only_text,
@@ -39,6 +40,30 @@ from astrbot_plugin_smart_segmentation.settings import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        (".,，。;；:：、 正文，句中", "正文，句中"),
+        ("，！？正文", "！？正文"),
+        (",!?正文", "!?正文"),
+        ("  ，  正文！", "  正文！"),
+        ("，。", ""),
+        ("（动作）", "（动作）"),
+        ("“引用”", "“引用”"),
+        ("- 列表", "- 列表"),
+        ("-.5", "-.5"),
+        ("，.5", ".5"),
+        ("../file", "../file"),
+        (r".\file", r".\file"),
+        (r"，..\file", r"..\file"),
+        ("  ```text\n;code\n```", "  ```text\n;code\n```"),
+        ("，![图](https://example.com/a)", "![图](https://example.com/a)"),
+    ],
+)
+def test_clean_segment_head(text: str, expected: str) -> None:
+    assert clean_segment_head(text) == expected
 
 
 @pytest.mark.parametrize(
@@ -885,7 +910,7 @@ class TestBoundsAlignSchema:
         defaults = SegmentationSettings()
         for field in fields(SegmentationSettings):
             expected = getattr(defaults, field.name)
-            if field.name == "tail_clean_marks":
+            if field.name in {"head_clean_marks", "tail_clean_marks"}:
                 expected = list(expected)
             assert schema[field.name]["default"] == expected, field.name
 
@@ -966,7 +991,7 @@ def test_markdown_title_link_stays_whole() -> None:
 def test_nested_link_stays_whole_and_long_title_link_is_bounded() -> None:
     """嵌套短链接保持完整；超长标题链接保住内容和平台长度上限。
 
-    `_mask_bracket_links`（嵌套方括号）与 `_mask_long_links`（超长 URL）都靠
+    `_bracket_link_spans`（嵌套方括号）与 `_long_link_spans`（超长 URL）都靠
     「URL 到第一个空白为止」判终点，标题链接在 URL 后有空白，于是它们把链接
     判成不合法、漏遮，括号 stage 随后把整条链接拆成两条消息。
     """
